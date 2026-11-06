@@ -4,6 +4,7 @@ import psycopg
 import pytest
 
 from app.db.migrate import apply_migrations
+from app.db.connection import connect
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
@@ -38,4 +39,13 @@ def conn(db_url: str):
         yield connection
     finally:
         connection.rollback()
+        connection.close()
+
+@pytest.fixture
+def ledger_conn(db_url: str):
+    """An autocommit connection, like the one the service layer uses."""
+    connection = connect(db_url)
+    try:
+        yield connection
+    finally:
         connection.close()
