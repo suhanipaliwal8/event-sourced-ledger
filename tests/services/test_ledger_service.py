@@ -121,7 +121,9 @@ def test_stale_version_is_rejected_by_unique_constraint(ledger_conn, monkeypatch
     asha = create_account(ledger_conn, "Asha")
     deposit(ledger_conn, asha.id, Money(1_000))
 
-    monkeypatch.setattr(ledger_service, "get_last_version", lambda conn, account_id: 0)
+    monkeypatch.setattr(
+        ledger_service, "get_account_state", lambda conn, account_id: (0, 0)
+    )
 
     tx = Transaction.transfer(EXTERNAL_ACCOUNT_ID, asha.id, Money(500))
     with pytest.raises(ConcurrentModificationError):

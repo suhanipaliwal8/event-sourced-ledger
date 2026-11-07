@@ -27,3 +27,6 @@ class DuplicateTransactionError(DomainError):
 
 class ConcurrentModificationError(DomainError):
     """Another writer appended to the same account at the same time. Safe to retry."""
+
+class InsufficientFundsError(DomainError):
+    """The transaction would overdraw an account that does not allow it."""

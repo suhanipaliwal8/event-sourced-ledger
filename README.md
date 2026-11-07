@@ -18,7 +18,7 @@ Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest
 | 1 | Domain model (Money, Entry, Transaction) | Done |
 | 2 | Database schema, migrations, append-only enforcement | Done |
 | 3 | Posting transactions atomically (repository + service) | Done |
-| 4 | Derived balances and overdraft rule | Planned |
+| 4 | Derived balances and overdraft rule | Done |
 | 5 | REST API | Planned |
 | 6 | Point-in-time queries | Planned |
 | 7 | Audit trail | Planned |
@@ -93,21 +93,34 @@ Plain SQL files in `migrations/`, applied in filename order and recorded in `sch
 python -m app.db.migrate
 ```
 
+## Balances and overdraft
+There is no balance column. An account's balance is **derived** by replaying its entries
+(`SUM(amount)`). The ledger as a whole always sums to zero, which `get_ledger_total` can verify.
+
+**Overdraft rule:** an account with `allow_negative = false` can never end a transaction
+below zero. SYSTEM accounts such as `EXTERNAL` may go negative.
+
+The service reads an account's **balance and last version in one SQL statement**, so they
+come from the same snapshot. If two writers race on one account, both try to append the same
+`account_version`; the `UNIQUE (account_id, account_version)` constraint rejects one of them
+with `ConcurrentModificationError`, so a stale balance can never cause an overdraft.
+(Locking and retries come in Phase 8.)
+
 ## How a transaction is posted
 `services/ledger_service.post_transaction(conn, tx)`:
 1. Open a database transaction (`BEGIN`)
 2. Check every account exists and its currency matches the entry
-3. Insert the `transactions` row
-4. Insert each entry with the next `account_version` for its account
+3. Per account: read balance + last version (one statement) and apply the overdraft rule
+4. Insert the `transactions` row, then each entry with the next `account_version`
 5. `COMMIT`, where the database re-checks the balance rule
 
 Any failure rolls everything back, so there are no partial transfers.
-Database errors are translated into domain errors:
 
 | Situation | Error |
 |---|---|
 | Unknown account | `AccountNotFoundError` |
 | Entry currency differs from account | `CurrencyMismatchError` |
+| Would overdraw a normal account | `InsufficientFundsError` |
 | Same transaction id posted twice | `DuplicateTransactionError` |
 | Two writers appended to one account at once | `ConcurrentModificationError` |
 
@@ -118,11 +131,15 @@ Service code needs an **autocommit** connection (`app.db.connection.connect`) so
 from app.db.connection import connect
 from app.domain.money import Money
 from app.repositories.accounts import create_account
-from app.services.ledger_service import deposit
+from app.services.ledger_service import deposit, withdraw, transfer, get_balance
 
 conn = connect()
 asha = create_account(conn, "Asha")
-deposit(conn, asha.id, Money(10_000))   # Rs 100.00 in paise
+rahul = create_account(conn, "Rahul")
+deposit(conn, asha.id, Money(10_000))            # Rs 100.00 in paise
+transfer(conn, asha.id, rahul.id, Money(2_500))
+withdraw(conn, rahul.id, Money(1_000))
+print(get_balance(conn, asha.id))                # Money(amount=7500, currency='INR')
 ```
 
 ## Design decisions
@@ -131,7 +148,8 @@ deposit(conn, asha.id, Money(10_000))   # Rs 100.00 in paise
 - **Layered architecture**: domain / repositories / services / API.
 - **Raw SQL with psycopg** (no ORM), so transactions and locking stay visible.
 - **Rules at two levels**: Python domain objects and database triggers.
-- **Per-account version numbers** with a UNIQUE constraint: a safety net against concurrent writers (locking and retries come in Phase 8).
+- **Derived balances**: computed from history, never stored as the source of truth.
+- **Per-account version numbers** with a UNIQUE constraint as a safety net against concurrent writers.
 
 ## Getting started
 ```bash
