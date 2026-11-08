@@ -119,3 +119,8 @@ def test_occurred_at_defaults_to_utc_now():
     tx = Transaction.transfer(A, B, Money(100))
     assert tx.occurred_at.tzinfo is not None
     assert tx.occurred_at.utcoffset() == timezone.utc.utcoffset(None)
+
+def test_transfer_accepts_explicit_occurred_at():
+    when = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    tx = Transaction.transfer(A, B, Money(100), occurred_at=when)
+    assert tx.occurred_at == when

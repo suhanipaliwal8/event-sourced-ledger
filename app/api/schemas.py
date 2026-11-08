@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import AwareDatetime, BaseModel, Field, StringConstraints
 
 from app.domain.account import Account
 from app.domain.money import Money
@@ -27,11 +27,14 @@ class AccountCreate(BaseModel):
 
 
 class MoneyRequest(BaseModel):
-    """Body for deposits and withdrawals."""
+    """Body for deposits and withdrawals (and the base of transfers)."""
 
     amount: Amount
     currency: CurrencyCode
     description: str | None = Field(default=None, max_length=200)
+    # Optional backdating. Must include a timezone (e.g. 2026-11-03T10:00:00Z)
+    # and must not be in the future.
+    occurred_at: AwareDatetime | None = None
 
 
 class TransferRequest(MoneyRequest):
@@ -91,7 +94,21 @@ class BalanceOut(BaseModel):
     account_id: UUID
     amount: int
     currency: str
+    as_of: datetime | None = None      # set only for point-in-time queries
+    known_at: datetime | None = None
 
     @classmethod
-    def from_money(cls, account_id: UUID, money: Money) -> "BalanceOut":
-        return cls(account_id=account_id, amount=money.amount, currency=money.currency)
+    def from_money(
+        cls,
+        account_id: UUID,
+        money: Money,
+        as_of: datetime | None = None,
+        known_at: datetime | None = None,
+    ) -> "BalanceOut":
+        return cls(
+            account_id=account_id,
+            amount=money.amount,
+            currency=money.currency,
+            as_of=as_of,
+            known_at=known_at,
+        )

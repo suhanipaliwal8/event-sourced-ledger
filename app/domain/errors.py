@@ -33,3 +33,6 @@ class InsufficientFundsError(DomainError):
 
 class SystemAccountNotAllowedError(DomainError):
     """A SYSTEM account was used through the public API."""
+
+class FutureTransactionError(DomainError):
+    """occurred_at is in the future; transactions can only be dated now or earlier."""

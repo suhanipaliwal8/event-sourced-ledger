@@ -6,7 +6,7 @@ not as a mutable balance column.
 ## Core idea
 - Every balance change is an append-only entry. Nothing is ever updated or deleted.
 - Every transaction has entries that sum to zero (double-entry bookkeeping).
-- Balances are always derived from history.
+- Balances are always derived from history, so any past moment can be reconstructed.
 
 ## Tech stack
 Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest · GitHub Actions
@@ -20,7 +20,7 @@ Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest
 | 3 | Posting transactions atomically (repository + service) | Done |
 | 4 | Derived balances and overdraft rule | Done |
 | 5 | REST API | Done |
-| 6 | Point-in-time queries | Planned |
+| 6 | Point-in-time queries | Done |
 | 7 | Audit trail | Planned |
 | 8 | Concurrency | Planned |
 | 9 | Idempotency and hardening | Planned |
@@ -46,10 +46,12 @@ Floats and numeric strings are rejected. Every money request states its `currenc
 | GET | /health | Liveness check | 200 |
 | POST | /accounts | Create a customer account | 201 |
 | GET | /accounts/{id} | Read an account | 200 |
-| GET | /accounts/{id}/balance | Balance derived from the account's entries | 200 |
+| GET | /accounts/{id}/balance | Current balance, or a historical one with `as_of` / `known_at` | 200 |
 | POST | /accounts/{id}/deposits | Deposit money (from the outside world) | 201 |
 | POST | /accounts/{id}/withdrawals | Withdraw money (to the outside world) | 201 |
 | POST | /transfers | Transfer between two customer accounts | 201 |
+
+Deposits, withdrawals and transfers accept an optional `occurred_at` (see Point-in-time queries).
 
 Example:
 ```bash
@@ -59,7 +61,9 @@ curl -s -X POST http://127.0.0.1:8000/accounts \
 
 curl -s -X POST http://127.0.0.1:8000/accounts/<ACCOUNT_ID>/deposits \
   -H "Content-Type: application/json" \
-  -d '{"amount": 10000, "currency": "INR"}'
+  -d '{"amount": 10000, "currency": "INR", "occurred_at": "2026-11-03T10:00:00Z"}'
+
+curl -s "http://127.0.0.1:8000/accounts/<ACCOUNT_ID>/balance?as_of=2026-11-04T00:00:00Z"
 ```
 
 ### Errors
@@ -73,8 +77,9 @@ Business errors return `{"error": {"code": "...", "message": "..."}}`.
 | 409 | `duplicate_transaction` | Transaction id already posted |
 | 409 | `concurrent_modification` | Another writer changed the same account; safe to retry |
 | 422 | `currency_mismatch` | Request currency differs from the account currency |
+| 422 | `occurred_at_in_future` | `occurred_at` is later than now |
 | 422 | `invalid_money`, `invalid_transaction`, `unbalanced_transaction` | Request breaks a domain rule |
-| 422 | (FastAPI format) | Malformed request body or path parameter |
+| 422 | (FastAPI format) | Malformed body or parameter, including datetimes without a timezone |
 
 **422** means the request itself is wrong; **409** means the request is fine but conflicts with the current state.
 
@@ -153,13 +158,34 @@ come from the same snapshot. If two writers race on one account, both try to app
 with `ConcurrentModificationError`, so a stale balance can never cause an overdraft.
 (Locking and retries come in Phase 8.)
 
+## Point-in-time queries
+Because history is kept as events, any past balance is just a sum over a filtered set of entries.
+Each transaction carries two times:
+
+| Time | Column | Meaning |
+|---|---|---|
+| valid time | `occurred_at` | When it happened in the real world. May be backdated. |
+| system time | `recorded_at` | When the ledger saved it. Set by the database. |
+
+`GET /accounts/{id}/balance` accepts:
+- `as_of`: count only entries that **occurred** by this moment (inclusive). "What was the balance on Tuesday, as far as we know today?"
+- `known_at`: additionally count only entries the ledger had **recorded** by this moment. "What did our books say on Tuesday?"
+
+Datetimes must include a timezone (use `Z` or `%2B` for `+` in URLs).
+
+Rules and trade-offs:
+- Transactions may be **backdated but never future-dated**, so "balance as of now" always equals the current balance.
+- **Known limitation:** the overdraft rule checks the balance **now**. A backdated withdrawal can make a *past* balance negative if today's balance can cover it. This is pinned down by a test.
+- The query is a join plus `SUM` over the account's history; snapshots (Phase 10) will address performance.
+
 ## How a transaction is posted
 `services/ledger_service.post_transaction(conn, tx)`:
-1. Open a database transaction (`BEGIN`)
-2. Check every account exists and its currency matches the entry
-3. Per account: read balance + last version (one statement) and apply the overdraft rule
-4. Insert the `transactions` row, then each entry with the next `account_version`
-5. `COMMIT`, where the database re-checks the balance rule
+1. Reject future-dated transactions
+2. Open a database transaction (`BEGIN`)
+3. Check every account exists and its currency matches the entry
+4. Per account: read balance + last version (one statement) and apply the overdraft rule
+5. Insert the `transactions` row, then each entry with the next `account_version`
+6. `COMMIT`, where the database re-checks the balance rule
 
 Any failure rolls everything back, so there are no partial transfers.
 Service code needs an **autocommit** connection (`app.db.connection.connect`) so that
@@ -176,6 +202,7 @@ The API opens one such connection per request (`app/api/dependencies.py`).
 - **Raw SQL with psycopg** (no ORM), so transactions and locking stay visible.
 - **Rules at two levels**: Python domain objects and database triggers.
 - **Derived balances**: computed from history, never stored as the source of truth.
+- **Two time axes** (`occurred_at`, `recorded_at`) so we can answer both "what was true" and "what did we know".
 - **Per-account version numbers** with a UNIQUE constraint as a safety net against concurrent writers.
 
 ## Getting started
