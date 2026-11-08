@@ -58,6 +58,7 @@ class Transaction:
         to_account: UUID,
         money: Money,
         description: str = "transfer",
+        occurred_at: datetime | None = None,
     ) -> "Transaction":
         """Convenience builder: move `money` from one account to another."""
         if from_account == to_account:
@@ -67,4 +68,5 @@ class Transaction:
         return cls(
             description=description,
             entries=(Entry(from_account, -money), Entry(to_account, money)),
+            occurred_at=occurred_at or _utc_now(),
         )
