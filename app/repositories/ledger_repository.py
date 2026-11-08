@@ -46,3 +46,27 @@ def insert_entry(
         "VALUES (%s, %s, %s, %s)",
         (transaction_id, account_id, account_version, amount),
     )
+
+def get_balance_at(
+    conn: psycopg.Connection,
+    account_id: UUID,
+    as_of,
+    known_at=None,
+) -> int:
+    """Balance of an account using only entries that had occurred by `as_of`.
+
+    If `known_at` is given, also only entries our ledger had RECORDED by then
+    ("what did the books say at that moment?").
+    Both bounds are inclusive. Datetimes must be timezone-aware.
+    """
+    sql = (
+        "SELECT COALESCE(SUM(e.amount), 0) "
+        "FROM entries e JOIN transactions t ON t.id = e.transaction_id "
+        "WHERE e.account_id = %s AND t.occurred_at <= %s"
+    )
+    params = [account_id, as_of]
+    if known_at is not None:
+        sql += " AND t.recorded_at <= %s"
+        params.append(known_at)
+    row = conn.execute(sql, params).fetchone()
+    return int(row[0])
