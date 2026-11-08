@@ -3,6 +3,11 @@ import os
 import psycopg
 import pytest
 
+from fastapi.testclient import TestClient
+
+from app.api.dependencies import get_conn
+from app.main import app
+
 from app.db.migrate import apply_migrations
 from app.db.connection import connect
 
@@ -49,3 +54,18 @@ def ledger_conn(db_url: str):
         yield connection
     finally:
         connection.close()
+
+@pytest.fixture
+def client(db_url: str):
+    """A test HTTP client whose requests use the TEST database."""
+
+    def override_get_conn():
+        conn = connect(db_url)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    app.dependency_overrides[get_conn] = override_get_conn
+    yield TestClient(app)
+    app.dependency_overrides.clear()

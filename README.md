@@ -19,7 +19,7 @@ Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest
 | 2 | Database schema, migrations, append-only enforcement | Done |
 | 3 | Posting transactions atomically (repository + service) | Done |
 | 4 | Derived balances and overdraft rule | Done |
-| 5 | REST API | Planned |
+| 5 | REST API | Done |
 | 6 | Point-in-time queries | Planned |
 | 7 | Audit trail | Planned |
 | 8 | Concurrency | Planned |
@@ -27,12 +27,59 @@ Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest
 
 ## Architecture
 ```
+api/           FastAPI routes, request/response schemas, error mapping (thin: no business rules)
 domain/        pure Python rules: Money, Entry, Transaction, Account, errors
-repositories/  SQL only, no business decisions
 services/      business flow; owns the database transaction (unit of work)
+repositories/  SQL only, no business decisions
 db/            connection and migration runner
 migrations/    numbered SQL files
 ```
+
+## API
+Interactive docs (Swagger UI): `http://127.0.0.1:8000/docs`
+
+All amounts are **integers in minor units** (paise/cents): `2500` means Rs 25.00.
+Floats and numeric strings are rejected. Every money request states its `currency` explicitly.
+
+| Method | Path | Description | Success |
+|---|---|---|---|
+| GET | /health | Liveness check | 200 |
+| POST | /accounts | Create a customer account | 201 |
+| GET | /accounts/{id} | Read an account | 200 |
+| GET | /accounts/{id}/balance | Balance derived from the account's entries | 200 |
+| POST | /accounts/{id}/deposits | Deposit money (from the outside world) | 201 |
+| POST | /accounts/{id}/withdrawals | Withdraw money (to the outside world) | 201 |
+| POST | /transfers | Transfer between two customer accounts | 201 |
+
+Example:
+```bash
+curl -s -X POST http://127.0.0.1:8000/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Asha", "currency": "INR"}'
+
+curl -s -X POST http://127.0.0.1:8000/accounts/<ACCOUNT_ID>/deposits \
+  -H "Content-Type: application/json" \
+  -d '{"amount": 10000, "currency": "INR"}'
+```
+
+### Errors
+Business errors return `{"error": {"code": "...", "message": "..."}}`.
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 404 | `account_not_found` | Unknown account |
+| 403 | `system_account_not_allowed` | SYSTEM accounts (e.g. EXTERNAL) cannot be used through the public API |
+| 409 | `insufficient_funds` | Would overdraw a normal account |
+| 409 | `duplicate_transaction` | Transaction id already posted |
+| 409 | `concurrent_modification` | Another writer changed the same account; safe to retry |
+| 422 | `currency_mismatch` | Request currency differs from the account currency |
+| 422 | `invalid_money`, `invalid_transaction`, `unbalanced_transaction` | Request breaks a domain rule |
+| 422 | (FastAPI format) | Malformed request body or path parameter |
+
+**422** means the request itself is wrong; **409** means the request is fine but conflicts with the current state.
+
+> **Known limitation:** the API has **no authentication or authorization**. It is a learning
+> project; a real bank API would need identity and permission checks.
 
 ## Domain model
 | Type | Meaning |
@@ -115,37 +162,17 @@ with `ConcurrentModificationError`, so a stale balance can never cause an overdr
 5. `COMMIT`, where the database re-checks the balance rule
 
 Any failure rolls everything back, so there are no partial transfers.
-
-| Situation | Error |
-|---|---|
-| Unknown account | `AccountNotFoundError` |
-| Entry currency differs from account | `CurrencyMismatchError` |
-| Would overdraw a normal account | `InsufficientFundsError` |
-| Same transaction id posted twice | `DuplicateTransactionError` |
-| Two writers appended to one account at once | `ConcurrentModificationError` |
-
 Service code needs an **autocommit** connection (`app.db.connection.connect`) so that
 `conn.transaction()` is a real `BEGIN`/`COMMIT` and deferred triggers fire inside the service.
-
-```python
-from app.db.connection import connect
-from app.domain.money import Money
-from app.repositories.accounts import create_account
-from app.services.ledger_service import deposit, withdraw, transfer, get_balance
-
-conn = connect()
-asha = create_account(conn, "Asha")
-rahul = create_account(conn, "Rahul")
-deposit(conn, asha.id, Money(10_000))            # Rs 100.00 in paise
-transfer(conn, asha.id, rahul.id, Money(2_500))
-withdraw(conn, rahul.id, Money(1_000))
-print(get_balance(conn, asha.id))                # Money(amount=7500, currency='INR')
-```
+The API opens one such connection per request (`app/api/dependencies.py`).
 
 ## Design decisions
-- **Integer minor units** instead of floats, to avoid rounding errors.
+- **Integer minor units** instead of floats, to avoid rounding errors (also strict in the API).
 - **Immutable objects** (frozen dataclasses), matching the append-only model.
-- **Layered architecture**: domain / repositories / services / API.
+- **Layered architecture**: api / services / repositories / domain.
+- **Thin API layer**: routes translate HTTP to service calls; business rules live below.
+- **Central error mapping**: domain errors become stable HTTP status + `code` pairs.
+- **SYSTEM accounts are not reachable from the public API**, otherwise money could be minted.
 - **Raw SQL with psycopg** (no ORM), so transactions and locking stay visible.
 - **Rules at two levels**: Python domain objects and database triggers.
 - **Derived balances**: computed from history, never stored as the source of truth.
@@ -159,14 +186,9 @@ pip install -r requirements.txt
 docker compose up -d               # PostgreSQL, host port 5433 -> container 5432
 docker compose exec db psql -U ledger -d ledger -c "CREATE DATABASE ledger_test;"   # once
 python -m app.db.migrate           # create the tables
-uvicorn app.main:app --reload      # run the API
+uvicorn app.main:app --reload      # run the API, then open /docs
 pytest                             # run tests (needs PostgreSQL running)
 ```
-
-## Endpoints
-| Method | Path | Description |
-|---|---|---|
-| GET | /health | Liveness check |
 
 ## Git workflow
 - One branch per phase: `phase-N/short-name`
