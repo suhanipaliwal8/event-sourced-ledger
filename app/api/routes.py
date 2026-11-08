@@ -1,0 +1,101 @@
+from typing import Annotated
+from uuid import UUID
+
+import psycopg
+from fastapi import APIRouter, Depends
+
+from app.api.dependencies import get_conn
+from app.api.schemas import (
+    AccountCreate,
+    AccountOut,
+    BalanceOut,
+    MoneyRequest,
+    TransactionOut,
+    TransferRequest,
+)
+from app.domain.errors import AccountNotFoundError, SystemAccountNotAllowedError
+from app.domain.money import Money
+from app.repositories import accounts as accounts_repo
+from app.services import ledger_service
+
+router = APIRouter()
+
+# Annotated shortcut: "give me a database connection for this request".
+Conn = Annotated[psycopg.Connection, Depends(get_conn)]
+
+
+def _require_customer_account(conn: psycopg.Connection, account_id: UUID) -> None:
+    """Public endpoints may only move money on CUSTOMER accounts.
+
+    Without this, a client could transfer money OUT of the EXTERNAL account
+    and effectively mint money.
+    """
+    account = accounts_repo.get_account(conn, account_id)
+    if account is None:
+        raise AccountNotFoundError(f"account {account_id} does not exist")
+    if account.kind != "CUSTOMER":
+        raise SystemAccountNotAllowedError(
+            "system accounts cannot be used through the public API"
+        )
+
+
+@router.post("/accounts", response_model=AccountOut, status_code=201)
+def create_account(body: AccountCreate, conn: Conn):
+    account = accounts_repo.create_account(conn, body.name, currency=body.currency)
+    return AccountOut.from_domain(account)
+
+
+@router.get("/accounts/{account_id}", response_model=AccountOut)
+def read_account(account_id: UUID, conn: Conn):
+    account = accounts_repo.get_account(conn, account_id)
+    if account is None:
+        raise AccountNotFoundError(f"account {account_id} does not exist")
+    return AccountOut.from_domain(account)
+
+
+@router.get("/accounts/{account_id}/balance", response_model=BalanceOut)
+def read_balance(account_id: UUID, conn: Conn):
+    money = ledger_service.get_balance(conn, account_id)
+    return BalanceOut.from_money(account_id, money)
+
+
+@router.post(
+    "/accounts/{account_id}/deposits", response_model=TransactionOut, status_code=201
+)
+def make_deposit(account_id: UUID, body: MoneyRequest, conn: Conn):
+    _require_customer_account(conn, account_id)
+    tx = ledger_service.deposit(
+        conn,
+        account_id,
+        Money(body.amount, body.currency),
+        body.description or "deposit",
+    )
+    return TransactionOut.from_domain(tx)
+
+
+@router.post(
+    "/accounts/{account_id}/withdrawals", response_model=TransactionOut, status_code=201
+)
+def make_withdrawal(account_id: UUID, body: MoneyRequest, conn: Conn):
+    _require_customer_account(conn, account_id)
+    tx = ledger_service.withdraw(
+        conn,
+        account_id,
+        Money(body.amount, body.currency),
+        body.description or "withdrawal",
+    )
+    return TransactionOut.from_domain(tx)
+
+
+@router.post("/transfers", response_model=TransactionOut, status_code=201)
+def make_transfer(body: TransferRequest, conn: Conn):
+    _require_customer_account(conn, body.from_account_id)
+    _require_customer_account(conn, body.to_account_id)
+    tx = ledger_service.transfer(
+        conn,
+        body.from_account_id,
+        body.to_account_id,
+        Money(body.amount, body.currency),
+        body.description or "transfer",
+    )
+    return TransactionOut.from_domain(tx)
