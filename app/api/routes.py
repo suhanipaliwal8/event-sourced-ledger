@@ -1,8 +1,10 @@
+from datetime import datetime, timezone
 from typing import Annotated
 from uuid import UUID
 
 import psycopg
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
+from pydantic import AwareDatetime
 
 from app.api.dependencies import get_conn
 from app.api.schemas import (
@@ -54,9 +56,25 @@ def read_account(account_id: UUID, conn: Conn):
 
 
 @router.get("/accounts/{account_id}/balance", response_model=BalanceOut)
-def read_balance(account_id: UUID, conn: Conn):
-    money = ledger_service.get_balance(conn, account_id)
-    return BalanceOut.from_money(account_id, money)
+def read_balance(
+    account_id: UUID,
+    conn: Conn,
+    as_of: Annotated[
+        AwareDatetime | None,
+        Query(description="Balance as of this moment (needs a timezone, e.g. ...Z)"),
+    ] = None,
+    known_at: Annotated[
+        AwareDatetime | None,
+        Query(description="Only count entries the ledger had recorded by this moment"),
+    ] = None,
+):
+    if as_of is None and known_at is None:
+        money = ledger_service.get_balance(conn, account_id)
+        return BalanceOut.from_money(account_id, money)
+
+    effective_as_of = as_of or datetime.now(timezone.utc)
+    money = ledger_service.get_balance_as_of(conn, account_id, effective_as_of, known_at)
+    return BalanceOut.from_money(account_id, money, effective_as_of, known_at)
 
 
 @router.post(
@@ -69,6 +87,7 @@ def make_deposit(account_id: UUID, body: MoneyRequest, conn: Conn):
         account_id,
         Money(body.amount, body.currency),
         body.description or "deposit",
+        body.occurred_at,
     )
     return TransactionOut.from_domain(tx)
 
@@ -83,6 +102,7 @@ def make_withdrawal(account_id: UUID, body: MoneyRequest, conn: Conn):
         account_id,
         Money(body.amount, body.currency),
         body.description or "withdrawal",
+        body.occurred_at,
     )
     return TransactionOut.from_domain(tx)
 
@@ -97,5 +117,6 @@ def make_transfer(body: TransferRequest, conn: Conn):
         body.to_account_id,
         Money(body.amount, body.currency),
         body.description or "transfer",
+        body.occurred_at,
     )
     return TransactionOut.from_domain(tx)

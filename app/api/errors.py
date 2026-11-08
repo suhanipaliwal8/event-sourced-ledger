@@ -13,6 +13,7 @@ _ERROR_MAP = [
     (e.DuplicateTransactionError, 409, "duplicate_transaction"),
     (e.ConcurrentModificationError, 409, "concurrent_modification"),
     (e.CurrencyMismatchError, 422, "currency_mismatch"),
+    (e.FutureTransactionError, 422, "occurred_at_in_future"),
     (e.UnbalancedTransactionError, 422, "unbalanced_transaction"),
     (e.InvalidMoneyError, 422, "invalid_money"),
     (e.InvalidTransactionError, 422, "invalid_transaction"),
