@@ -30,3 +30,6 @@ class ConcurrentModificationError(DomainError):
 
 class InsufficientFundsError(DomainError):
     """The transaction would overdraw an account that does not allow it."""
+
+class SystemAccountNotAllowedError(DomainError):
+    """A SYSTEM account was used through the public API."""
