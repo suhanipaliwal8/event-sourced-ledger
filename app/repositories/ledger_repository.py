@@ -3,12 +3,15 @@ from uuid import UUID
 import psycopg
 
 from app.domain.transaction import Transaction
+from app.domain.entry import Entry
+from app.domain.money import Money
 
 
 def insert_transaction(conn: psycopg.Connection, tx: Transaction) -> None:
     conn.execute(
-        "INSERT INTO transactions (id, description, occurred_at) VALUES (%s, %s, %s)",
-        (tx.id, tx.description, tx.occurred_at),
+        "INSERT INTO transactions (id, description, idempotency_key, occurred_at) "
+        "VALUES (%s, %s, %s, %s)",
+        (tx.id, tx.description, tx.idempotency_key, tx.occurred_at),
     )
 
 
@@ -70,3 +73,32 @@ def get_balance_at(
         params.append(known_at)
     row = conn.execute(sql, params).fetchone()
     return int(row[0])
+
+def find_transaction_by_idempotency_key(
+    conn: psycopg.Connection, key: str
+) -> Transaction | None:
+    """Rebuild the stored Transaction that was posted with this idempotency key."""
+    row = conn.execute(
+        "SELECT id, description, occurred_at FROM transactions WHERE idempotency_key = %s",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    entry_rows = conn.execute(
+        "SELECT e.account_id, e.amount, a.currency "
+        "FROM entries e JOIN accounts a ON a.id = e.account_id "
+        "WHERE e.transaction_id = %s ORDER BY e.id",
+        (row[0],),
+    ).fetchall()
+
+    return Transaction(
+        description=row[1],
+        entries=tuple(
+            Entry(account_id, Money(amount, currency.strip()))
+            for account_id, amount, currency in entry_rows
+        ),
+        id=row[0],
+        occurred_at=row[2],
+        idempotency_key=key,
+    )
