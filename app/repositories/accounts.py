@@ -30,3 +30,11 @@ def get_account(conn: psycopg.Connection, account_id: UUID) -> Account | None:
     if row is None:
         return None
     return Account(*row)
+
+def lock_account(conn: psycopg.Connection, account_id: UUID) -> None:
+    """Take a row lock on the account until the current transaction ends.
+
+    Any other transaction that tries to lock the same account WAITS here.
+    Must be called inside a transaction (it is released on COMMIT or ROLLBACK).
+    """
+    conn.execute("SELECT 1 FROM accounts WHERE id = %s FOR UPDATE", (account_id,))
