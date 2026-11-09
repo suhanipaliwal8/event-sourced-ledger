@@ -1,3 +1,5 @@
+import random
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from uuid import UUID
@@ -14,7 +16,7 @@ from app.domain.errors import (
 )
 from app.domain.money import Money
 from app.domain.transaction import Transaction
-from app.repositories.accounts import get_account
+from app.repositories.accounts import get_account, lock_account
 from app.repositories.ledger_repository import (
     get_account_state,
     get_balance_at,
@@ -23,8 +25,15 @@ from app.repositories.ledger_repository import (
     insert_transaction,
 )
 
+# How long a writer waits for another writer's account lock before giving up.
+LOCK_TIMEOUT = "5s"
+# How many times a conflicting post is attempted in total.
+MAX_ATTEMPTS = 3
 
-def post_transaction(conn: psycopg.Connection, tx: Transaction) -> Transaction:
+
+def post_transaction(
+    conn: psycopg.Connection, tx: Transaction, max_attempts: int = MAX_ATTEMPTS
+) -> Transaction:
     """Save a domain Transaction atomically: all rows, or none.
 
     `conn` must be an autocommit connection (see app.db.connection.connect), so
@@ -32,14 +41,33 @@ def post_transaction(conn: psycopg.Connection, tx: Transaction) -> Transaction:
 
     Transactions may be backdated, but never future-dated. That keeps
     "balance as of now" identical to the current balance.
+
+    Transient conflicts (ConcurrentModificationError) are retried a few times
+    with a short random pause. Business errors are NEVER retried.
     """
     if tx.occurred_at > datetime.now(timezone.utc):
         raise FutureTransactionError(
             "occurred_at is in the future; transactions can only be dated now or earlier"
         )
 
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _post_once(conn, tx)
+        except ConcurrentModificationError:
+            if attempt >= max_attempts:
+                raise
+            time.sleep(random.uniform(0.005, 0.02) * attempt)   # backoff, then try again
+
+
+def _post_once(conn: psycopg.Connection, tx: Transaction) -> Transaction:
+    """One attempt: a single database transaction."""
     try:
         with conn.transaction():  # BEGIN ... COMMIT, or ROLLBACK on any exception
+            # Never wait forever for somebody else's lock (applies to this transaction only).
+            conn.execute("SELECT set_config('lock_timeout', %s, true)", (LOCK_TIMEOUT,))
+
             accounts = _load_accounts(conn, tx)
 
             # Net change per account (an account can appear in several entries).
@@ -47,10 +75,18 @@ def post_transaction(conn: psycopg.Connection, tx: Transaction) -> Transaction:
             for entry in tx.entries:
                 deltas[entry.account_id] += entry.money.amount
 
+            # LOCK every affected account, ALWAYS in sorted order. Two transfers
+            # A->B and B->A therefore both lock the lower id first, so they queue
+            # instead of deadlocking. After a wait, the reads below see whatever
+            # the previous writer committed (READ COMMITTED: fresh snapshot per statement).
+            sorted_ids = sorted(deltas)
+            for account_id in sorted_ids:
+                lock_account(conn, account_id)
+
             # Overdraft check. One consistent (balance, version) read per account.
             # NOTE: this checks the balance NOW, not at the transaction's occurred_at.
             next_version: dict[UUID, int] = {}
-            for account_id in sorted(deltas):
+            for account_id in sorted_ids:
                 balance, last_version = get_account_state(conn, account_id)
                 accounts[account_id].new_balance_after(balance, deltas[account_id])
                 next_version[account_id] = last_version + 1
@@ -67,6 +103,7 @@ def post_transaction(conn: psycopg.Connection, tx: Transaction) -> Transaction:
         # business error, based on which constraint was violated.
         constraint = exc.diag.constraint_name
         if constraint == "entries_account_version_unique":
+            # Safety net: someone appended without waiting for our lock.
             raise ConcurrentModificationError(
                 "another writer appended to the same account; please retry"
             ) from exc
@@ -75,6 +112,12 @@ def post_transaction(conn: psycopg.Connection, tx: Transaction) -> Transaction:
                 f"transaction {tx.id} has already been posted"
             ) from exc
         raise
+    except psycopg.errors.LockNotAvailable as exc:
+        raise ConcurrentModificationError(
+            "timed out waiting for another writer; please retry"
+        ) from exc
+    except psycopg.errors.DeadlockDetected as exc:
+        raise ConcurrentModificationError("deadlock detected; please retry") from exc
     return tx
 
 

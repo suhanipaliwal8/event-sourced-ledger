@@ -7,6 +7,7 @@ not as a mutable balance column.
 - Every balance change is an append-only entry. Nothing is ever updated or deleted.
 - Every transaction has entries that sum to zero (double-entry bookkeeping).
 - Balances are always derived from history, so any past moment can be reconstructed and explained.
+- Concurrent writers cannot corrupt balances.
 
 ## Tech stack
 Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest · GitHub Actions
@@ -22,7 +23,7 @@ Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest
 | 5 | REST API | Done |
 | 6 | Point-in-time queries | Done |
 | 7 | Audit trail | Done |
-| 8 | Concurrency | Planned |
+| 8 | Concurrency control | Done |
 | 9 | Idempotency and hardening | Planned |
 
 ## Architecture
@@ -77,7 +78,7 @@ Business errors return `{"error": {"code": "...", "message": "..."}}`.
 | 403 | `system_account_not_allowed` | SYSTEM accounts (e.g. EXTERNAL) cannot be used through the public API |
 | 409 | `insufficient_funds` | Would overdraw a normal account |
 | 409 | `duplicate_transaction` | Transaction id already posted |
-| 409 | `concurrent_modification` | Another writer changed the same account; safe to retry |
+| 409 | `concurrent_modification` | Could not get exclusive access after retries (conflict, lock timeout or deadlock); safe to retry |
 | 422 | `currency_mismatch` | Request currency differs from the account currency |
 | 422 | `occurred_at_in_future` | `occurred_at` is later than now |
 | 422 | `invalid_money`, `invalid_transaction`, `unbalanced_transaction` | Request breaks a domain rule |
@@ -139,6 +140,7 @@ erDiagram
 - Entries of a transaction must sum to zero, checked **at COMMIT** (deferred constraint trigger).
 - A transaction must have at least 2 entries (deferred constraint trigger).
 - Entry amounts are never zero; accounts and transactions must exist.
+- `(account_id, account_version)` is unique, so two writers can never append the same version.
 
 ### Migrations
 Plain SQL files in `migrations/`, applied in filename order and recorded in `schema_migrations`.
@@ -154,11 +156,30 @@ There is no balance column. An account's balance is **derived** by replaying its
 **Overdraft rule:** an account with `allow_negative = false` can never end a transaction
 below zero. SYSTEM accounts such as `EXTERNAL` may go negative.
 
-The service reads an account's **balance and last version in one SQL statement**, so they
-come from the same snapshot. If two writers race on one account, both try to append the same
-`account_version`; the `UNIQUE (account_id, account_version)` constraint rejects one of them
-with `ConcurrentModificationError`, so a stale balance can never cause an overdraft.
-(Locking and retries come in Phase 8.)
+## Concurrency control
+**The problem:** two requests read the same balance, both decide "enough funds", both write: a lost update that can overdraw an account.
+
+**How it is prevented** (`services/ledger_service._post_once`):
+1. **Pessimistic row locks.** Inside the database transaction, every affected account row is locked with `SELECT ... FOR UPDATE`. A second writer touching the same account **waits**, then reads the data the first writer committed (READ COMMITTED gives a fresh snapshot per statement).
+2. **Lock ordering.** Accounts are always locked in sorted id order. A→B and B→A transfers both lock the lower id first, so they queue instead of **deadlocking**.
+3. **Lock timeout** (`LOCK_TIMEOUT`, 5s). A stuck lock holder cannot hang writers forever; a timeout becomes `ConcurrentModificationError`.
+4. **Optimistic safety net.** `UNIQUE (account_id, account_version)` still rejects a duplicate version if some code path ever skips the lock.
+5. **Retry with backoff.** `ConcurrentModificationError` is retried up to `MAX_ATTEMPTS` (3) with a short random pause. Business errors such as `InsufficientFundsError` are never retried. A deadlock reported by Postgres is also translated into this retriable error.
+
+**Isolation levels used:** READ COMMITTED (default) for writers, REPEATABLE READ (read-only) for the audit.
+SERIALIZABLE would also work but aborts more often; explicit locks are easier to reason about.
+
+**Trade-off, the hot account:** every deposit and withdrawal touches the single `EXTERNAL` account,
+so they queue behind each other across the whole bank. Correctness is preserved at the cost of
+throughput. Real systems use several clearing accounts or batch these movements.
+
+**How it is tested:** real threads, each with its own connection, released together by a barrier,
+asserting invariants (no overdraft, money conserved, ledger total zero, audit integrity OK).
+Waiting for a lock and the lock timeout are tested deterministically by holding a lock from the test.
+Race tests are probabilistic, so run them repeatedly:
+```bash
+for i in 1 2 3 4 5; do pytest tests/services/test_concurrency.py -q || break; done
+```
 
 ## Point-in-time queries
 Because history is kept as events, any past balance is just a sum over a filtered set of entries.
@@ -207,11 +228,12 @@ Design notes:
 ## How a transaction is posted
 `services/ledger_service.post_transaction(conn, tx)`:
 1. Reject future-dated transactions
-2. Open a database transaction (`BEGIN`)
+2. Open a database transaction (`BEGIN`) and set a lock timeout
 3. Check every account exists and its currency matches the entry
-4. Per account: read balance + last version (one statement) and apply the overdraft rule
-5. Insert the `transactions` row, then each entry with the next `account_version`
-6. `COMMIT`, where the database re-checks the balance rule
+4. Lock every affected account row, in sorted order
+5. Per account: read balance + last version (one statement) and apply the overdraft rule
+6. Insert the `transactions` row, then each entry with the next `account_version`
+7. `COMMIT`, where the database re-checks the balance rule
 
 Any failure rolls everything back, so there are no partial transfers.
 Service code needs an **autocommit** connection (`app.db.connection.connect`) so that
@@ -230,7 +252,7 @@ The API opens one such connection per request (`app/api/dependencies.py`).
 - **Derived balances**: computed from history, never stored as the source of truth.
 - **Two time axes** (`occurred_at`, `recorded_at`) so we can answer both "what was true" and "what did we know".
 - **Independent verification**: the audit re-derives the balance and cross-checks it, even though the database should make mismatches impossible.
-- **Per-account version numbers** with a UNIQUE constraint as a safety net against concurrent writers.
+- **Pessimistic locks plus an optimistic version check**: locks make writers queue, the unique version is the safety net.
 
 ## Getting started
 ```bash
