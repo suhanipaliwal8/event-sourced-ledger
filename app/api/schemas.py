@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, Field, StringConstraints
+from pydantic import AwareDatetime, BaseModel, ConfigDict ,Field, StringConstraints
 
 from app.domain.account import Account
 from app.domain.money import Money
@@ -112,3 +112,52 @@ class BalanceOut(BaseModel):
             as_of=as_of,
             known_at=known_at,
         )
+
+# ---------- audit trail ----------
+class FromDomain(BaseModel):
+    """Base for responses built straight from domain objects (read their attributes)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CounterpartyOut(FromDomain):
+    account_id: UUID
+    account_name: str
+    amount: int
+
+
+class AuditLineOut(FromDomain):
+    account_version: int
+    entry_id: int
+    transaction_id: UUID
+    description: str
+    amount: int
+    running_balance: int
+    occurred_at: datetime
+    recorded_at: datetime
+    counterparties: list[CounterpartyOut]
+    explanation: str
+
+
+class AuditSummaryOut(FromDomain):
+    entry_count: int
+    total_credits: int
+    total_debits: int
+    opening_balance: int
+    closing_balance: int
+
+
+class AuditIntegrityOut(FromDomain):
+    ok: bool
+    balance_matches: bool
+    versions_contiguous: bool
+    unbalanced_transactions: int
+
+
+class AuditOut(FromDomain):
+    account_id: UUID
+    currency: str
+    summary: AuditSummaryOut
+    integrity: AuditIntegrityOut
+    lines: list[AuditLineOut]
+    next_after_version: int | None
