@@ -3,7 +3,7 @@ from typing import Annotated
 from uuid import UUID
 
 import psycopg
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Header, Query
 from pydantic import AwareDatetime
 
 from app.api.dependencies import get_conn
@@ -25,6 +25,16 @@ router = APIRouter()
 
 # Annotated shortcut: "give me a database connection for this request".
 Conn = Annotated[psycopg.Connection, Depends(get_conn)]
+
+# Optional header (FastAPI turns idempotency_key into the header "Idempotency-Key").
+IdempotencyKey = Annotated[
+    str | None,
+    Header(
+        min_length=1,
+        max_length=255,
+        description="Optional. Retrying with the same key never posts twice.",
+    ),
+]
 
 
 def _require_customer_account(conn: psycopg.Connection, account_id: UUID) -> None:
@@ -81,7 +91,12 @@ def read_balance(
 @router.post(
     "/accounts/{account_id}/deposits", response_model=TransactionOut, status_code=201
 )
-def make_deposit(account_id: UUID, body: MoneyRequest, conn: Conn):
+def make_deposit(
+    account_id: UUID,
+    body: MoneyRequest,
+    conn: Conn,
+    idempotency_key: IdempotencyKey = None,
+):
     _require_customer_account(conn, account_id)
     tx = ledger_service.deposit(
         conn,
@@ -89,6 +104,7 @@ def make_deposit(account_id: UUID, body: MoneyRequest, conn: Conn):
         Money(body.amount, body.currency),
         body.description or "deposit",
         body.occurred_at,
+        idempotency_key,
     )
     return TransactionOut.from_domain(tx)
 
@@ -96,7 +112,12 @@ def make_deposit(account_id: UUID, body: MoneyRequest, conn: Conn):
 @router.post(
     "/accounts/{account_id}/withdrawals", response_model=TransactionOut, status_code=201
 )
-def make_withdrawal(account_id: UUID, body: MoneyRequest, conn: Conn):
+def make_withdrawal(
+    account_id: UUID,
+    body: MoneyRequest,
+    conn: Conn,
+    idempotency_key: IdempotencyKey = None,
+):
     _require_customer_account(conn, account_id)
     tx = ledger_service.withdraw(
         conn,
@@ -104,12 +125,17 @@ def make_withdrawal(account_id: UUID, body: MoneyRequest, conn: Conn):
         Money(body.amount, body.currency),
         body.description or "withdrawal",
         body.occurred_at,
+        idempotency_key,
     )
     return TransactionOut.from_domain(tx)
 
 
 @router.post("/transfers", response_model=TransactionOut, status_code=201)
-def make_transfer(body: TransferRequest, conn: Conn):
+def make_transfer(
+    body: TransferRequest,
+    conn: Conn,
+    idempotency_key: IdempotencyKey = None,
+):
     _require_customer_account(conn, body.from_account_id)
     _require_customer_account(conn, body.to_account_id)
     tx = ledger_service.transfer(
@@ -119,8 +145,10 @@ def make_transfer(body: TransferRequest, conn: Conn):
         Money(body.amount, body.currency),
         body.description or "transfer",
         body.occurred_at,
+        idempotency_key,
     )
     return TransactionOut.from_domain(tx)
+
 
 @router.get("/accounts/{account_id}/audit", response_model=AuditOut)
 def read_audit_trail(
