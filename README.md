@@ -6,7 +6,7 @@ not as a mutable balance column.
 ## Core idea
 - Every balance change is an append-only entry. Nothing is ever updated or deleted.
 - Every transaction has entries that sum to zero (double-entry bookkeeping).
-- Balances are always derived from history, so any past moment can be reconstructed.
+- Balances are always derived from history, so any past moment can be reconstructed and explained.
 
 ## Tech stack
 Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest · GitHub Actions
@@ -21,14 +21,14 @@ Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest
 | 4 | Derived balances and overdraft rule | Done |
 | 5 | REST API | Done |
 | 6 | Point-in-time queries | Done |
-| 7 | Audit trail | Planned |
+| 7 | Audit trail | Done |
 | 8 | Concurrency | Planned |
 | 9 | Idempotency and hardening | Planned |
 
 ## Architecture
 ```
 api/           FastAPI routes, request/response schemas, error mapping (thin: no business rules)
-domain/        pure Python rules: Money, Entry, Transaction, Account, errors
+domain/        pure Python rules: Money, Entry, Transaction, Account, audit replay, errors
 services/      business flow; owns the database transaction (unit of work)
 repositories/  SQL only, no business decisions
 db/            connection and migration runner
@@ -47,6 +47,7 @@ Floats and numeric strings are rejected. Every money request states its `currenc
 | POST | /accounts | Create a customer account | 201 |
 | GET | /accounts/{id} | Read an account | 200 |
 | GET | /accounts/{id}/balance | Current balance, or a historical one with `as_of` / `known_at` | 200 |
+| GET | /accounts/{id}/audit | Replayed history with running balances and integrity checks (paged) | 200 |
 | POST | /accounts/{id}/deposits | Deposit money (from the outside world) | 201 |
 | POST | /accounts/{id}/withdrawals | Withdraw money (to the outside world) | 201 |
 | POST | /transfers | Transfer between two customer accounts | 201 |
@@ -64,6 +65,7 @@ curl -s -X POST http://127.0.0.1:8000/accounts/<ACCOUNT_ID>/deposits \
   -d '{"amount": 10000, "currency": "INR", "occurred_at": "2026-11-03T10:00:00Z"}'
 
 curl -s "http://127.0.0.1:8000/accounts/<ACCOUNT_ID>/balance?as_of=2026-11-04T00:00:00Z"
+curl -s "http://127.0.0.1:8000/accounts/<ACCOUNT_ID>/audit?limit=20"
 ```
 
 ### Errors
@@ -178,6 +180,30 @@ Rules and trade-offs:
 - **Known limitation:** the overdraft rule checks the balance **now**. A backdated withdrawal can make a *past* balance negative if today's balance can cover it. This is pinned down by a test.
 - The query is a join plus `SUM` over the account's history; snapshots (Phase 10) will address performance.
 
+## Audit trail
+`GET /accounts/{id}/audit?after_version=0&limit=50` replays the account's entries in
+`account_version` order (the order they were recorded) and explains how it reached its balance.
+
+Each line contains: the entry amount, the **running balance** after it, the counterparty
+accounts, `occurred_at`, `recorded_at` and a readable `explanation`
+(e.g. `Sent 300 to Rahul (rent)`).
+
+The response also has a `summary` (entry count, total credits, total debits, opening and closing balance)
+and an `integrity` block with independent checks:
+
+| Check | Meaning |
+|---|---|
+| `balance_matches` | Replayed closing balance equals the balance from a separate `SUM` query |
+| `versions_contiguous` | Versions are exactly 1, 2, 3, ... (no missing or duplicated event) |
+| `unbalanced_transactions` | Transactions touching this account that do not sum to zero (must be 0) |
+| `ok` | All of the above pass |
+
+Design notes:
+- The replay is **pure domain code** (`domain/audit.py`) and is unit tested without a database.
+- All queries run in one read-only **REPEATABLE READ** transaction, so they see a single snapshot and a concurrent deposit cannot cause a false mismatch.
+- Summary and integrity cover the **full** history; only `lines` are paged, so running balances stay correct on every page. `next_after_version` is `null` on the last page.
+- The whole history is replayed per request; snapshots (Phase 10) will reduce that cost.
+
 ## How a transaction is posted
 `services/ledger_service.post_transaction(conn, tx)`:
 1. Reject future-dated transactions
@@ -203,6 +229,7 @@ The API opens one such connection per request (`app/api/dependencies.py`).
 - **Rules at two levels**: Python domain objects and database triggers.
 - **Derived balances**: computed from history, never stored as the source of truth.
 - **Two time axes** (`occurred_at`, `recorded_at`) so we can answer both "what was true" and "what did we know".
+- **Independent verification**: the audit re-derives the balance and cross-checks it, even though the database should make mismatches impossible.
 - **Per-account version numbers** with a UNIQUE constraint as a safety net against concurrent writers.
 
 ## Getting started
