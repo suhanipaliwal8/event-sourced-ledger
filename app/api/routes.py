@@ -10,6 +10,7 @@ from app.api.dependencies import get_conn
 from app.api.schemas import (
     AccountCreate,
     AccountOut,
+    AuditOut,
     BalanceOut,
     MoneyRequest,
     TransactionOut,
@@ -18,7 +19,7 @@ from app.api.schemas import (
 from app.domain.errors import AccountNotFoundError, SystemAccountNotAllowedError
 from app.domain.money import Money
 from app.repositories import accounts as accounts_repo
-from app.services import ledger_service
+from app.services import audit_service, ledger_service
 
 router = APIRouter()
 
@@ -120,3 +121,15 @@ def make_transfer(body: TransferRequest, conn: Conn):
         body.occurred_at,
     )
     return TransactionOut.from_domain(tx)
+
+@router.get("/accounts/{account_id}/audit", response_model=AuditOut)
+def read_audit_trail(
+    account_id: UUID,
+    conn: Conn,
+    after_version: Annotated[
+        int, Query(ge=0, description="Return only entries after this account_version")
+    ] = 0,
+    limit: Annotated[int, Query(ge=1, le=200, description="Page size")] = 50,
+):
+    report = audit_service.get_audit_trail(conn, account_id, after_version, limit)
+    return AuditOut.model_validate(report)
