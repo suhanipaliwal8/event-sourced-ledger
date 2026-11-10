@@ -11,6 +11,7 @@ _ERROR_MAP = [
     (e.SystemAccountNotAllowedError, 403, "system_account_not_allowed"),
     (e.InsufficientFundsError, 409, "insufficient_funds"),
     (e.DuplicateTransactionError, 409, "duplicate_transaction"),
+    (e.IdempotencyKeyReusedError, 409, "idempotency_key_reused"),
     (e.ConcurrentModificationError, 409, "concurrent_modification"),
     (e.CurrencyMismatchError, 422, "currency_mismatch"),
     (e.FutureTransactionError, 422, "occurred_at_in_future"),

@@ -13,11 +13,13 @@ from app.domain.errors import (
     CurrencyMismatchError,
     DuplicateTransactionError,
     FutureTransactionError,
+    IdempotencyKeyReusedError,
 )
 from app.domain.money import Money
 from app.domain.transaction import Transaction
 from app.repositories.accounts import get_account, lock_account
 from app.repositories.ledger_repository import (
+    find_transaction_by_idempotency_key,
     get_account_state,
     get_balance_at,
     get_ledger_total as _get_ledger_total,
@@ -41,6 +43,9 @@ def post_transaction(
 
     Transactions may be backdated, but never future-dated. That keeps
     "balance as of now" identical to the current balance.
+
+    If tx.idempotency_key was already used for the SAME request, the stored
+    transaction is returned and nothing new is written (a replay).
 
     Transient conflicts (ConcurrentModificationError) are retried a few times
     with a short random pause. Business errors are NEVER retried.
@@ -77,11 +82,18 @@ def _post_once(conn: psycopg.Connection, tx: Transaction) -> Transaction:
 
             # LOCK every affected account, ALWAYS in sorted order. Two transfers
             # A->B and B->A therefore both lock the lower id first, so they queue
-            # instead of deadlocking. After a wait, the reads below see whatever
-            # the previous writer committed (READ COMMITTED: fresh snapshot per statement).
+            # instead of deadlocking.
             sorted_ids = sorted(deltas)
             for account_id in sorted_ids:
                 lock_account(conn, account_id)
+
+            # IDEMPOTENCY: checked AFTER the locks. If an identical request is
+            # racing us, we waited for its lock and can now see its committed row.
+            # Checking first could wrongly report "insufficient funds" for a replay.
+            if tx.idempotency_key is not None:
+                existing = find_transaction_by_idempotency_key(conn, tx.idempotency_key)
+                if existing is not None:
+                    return _resolve_replay(existing, tx)
 
             # Overdraft check. One consistent (balance, version) read per account.
             # NOTE: this checks the balance NOW, not at the transaction's occurred_at.
@@ -100,7 +112,7 @@ def _post_once(conn: psycopg.Connection, tx: Transaction) -> Transaction:
                 next_version[entry.account_id] = version + 1
     except psycopg.errors.UniqueViolation as exc:
         # The rollback has already happened. Translate the DB error into a
-        # business error, based on which constraint was violated.
+        # business outcome, based on which constraint was violated.
         constraint = exc.diag.constraint_name
         if constraint == "entries_account_version_unique":
             # Safety net: someone appended without waiting for our lock.
@@ -111,6 +123,14 @@ def _post_once(conn: psycopg.Connection, tx: Transaction) -> Transaction:
             raise DuplicateTransactionError(
                 f"transaction {tx.id} has already been posted"
             ) from exc
+        if constraint == "transactions_idempotency_key_key":
+            # A request with this key committed between our check and our insert.
+            existing = find_transaction_by_idempotency_key(conn, tx.idempotency_key)
+            if existing is None:
+                raise ConcurrentModificationError(
+                    "idempotency key is being processed; please retry"
+                ) from exc
+            return _resolve_replay(existing, tx)
         raise
     except psycopg.errors.LockNotAvailable as exc:
         raise ConcurrentModificationError(
@@ -121,16 +141,26 @@ def _post_once(conn: psycopg.Connection, tx: Transaction) -> Transaction:
     return tx
 
 
+def _resolve_replay(existing: Transaction, requested: Transaction) -> Transaction:
+    """The key was used before: replay the original, unless the request differs."""
+    if not existing.same_request_as(requested):
+        raise IdempotencyKeyReusedError(
+            "this idempotency key was already used for a different request"
+        )
+    return existing
+
+
 def deposit(
     conn: psycopg.Connection,
     account_id: UUID,
     money: Money,
     description: str = "deposit",
     occurred_at: datetime | None = None,
+    idempotency_key: str | None = None,
 ) -> Transaction:
     """Money arrives from the outside world: EXTERNAL -x, account +x."""
     tx = Transaction.transfer(
-        EXTERNAL_ACCOUNT_ID, account_id, money, description, occurred_at
+        EXTERNAL_ACCOUNT_ID, account_id, money, description, occurred_at, idempotency_key
     )
     return post_transaction(conn, tx)
 
@@ -141,10 +171,11 @@ def withdraw(
     money: Money,
     description: str = "withdrawal",
     occurred_at: datetime | None = None,
+    idempotency_key: str | None = None,
 ) -> Transaction:
     """Money leaves to the outside world: account -x, EXTERNAL +x."""
     tx = Transaction.transfer(
-        account_id, EXTERNAL_ACCOUNT_ID, money, description, occurred_at
+        account_id, EXTERNAL_ACCOUNT_ID, money, description, occurred_at, idempotency_key
     )
     return post_transaction(conn, tx)
 
@@ -156,9 +187,10 @@ def transfer(
     money: Money,
     description: str = "transfer",
     occurred_at: datetime | None = None,
+    idempotency_key: str | None = None,
 ) -> Transaction:
     tx = Transaction.transfer(
-        from_account_id, to_account_id, money, description, occurred_at
+        from_account_id, to_account_id, money, description, occurred_at, idempotency_key
     )
     return post_transaction(conn, tx)
 

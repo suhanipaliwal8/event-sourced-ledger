@@ -7,7 +7,7 @@ not as a mutable balance column.
 - Every balance change is an append-only entry. Nothing is ever updated or deleted.
 - Every transaction has entries that sum to zero (double-entry bookkeeping).
 - Balances are always derived from history, so any past moment can be reconstructed and explained.
-- Concurrent writers cannot corrupt balances.
+- Concurrent writers cannot corrupt balances, and retried requests never post twice.
 
 ## Tech stack
 Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest · GitHub Actions
@@ -24,7 +24,9 @@ Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest
 | 6 | Point-in-time queries | Done |
 | 7 | Audit trail | Done |
 | 8 | Concurrency control | Done |
-| 9 | Idempotency and hardening | Planned |
+| 9 | Idempotency and hardening | Done |
+| 10 | Snapshots (stretch) | Planned |
+| 11 | Multi-currency (stretch) | Planned |
 
 ## Architecture
 ```
@@ -32,7 +34,7 @@ api/           FastAPI routes, request/response schemas, error mapping (thin: no
 domain/        pure Python rules: Money, Entry, Transaction, Account, audit replay, errors
 services/      business flow; owns the database transaction (unit of work)
 repositories/  SQL only, no business decisions
-db/            connection and migration runner
+db/            connection/config, migration runner, health check
 migrations/    numbered SQL files
 ```
 
@@ -44,7 +46,8 @@ Floats and numeric strings are rejected. Every money request states its `currenc
 
 | Method | Path | Description | Success |
 |---|---|---|---|
-| GET | /health | Liveness check | 200 |
+| GET | /health | Liveness: the process is up (never touches the database) | 200 |
+| GET | /health/ready | Readiness: the database is reachable | 200 / 503 |
 | POST | /accounts | Create a customer account | 201 |
 | GET | /accounts/{id} | Read an account | 200 |
 | GET | /accounts/{id}/balance | Current balance, or a historical one with `as_of` / `known_at` | 200 |
@@ -53,7 +56,8 @@ Floats and numeric strings are rejected. Every money request states its `currenc
 | POST | /accounts/{id}/withdrawals | Withdraw money (to the outside world) | 201 |
 | POST | /transfers | Transfer between two customer accounts | 201 |
 
-Deposits, withdrawals and transfers accept an optional `occurred_at` (see Point-in-time queries).
+Deposits, withdrawals and transfers accept an optional `occurred_at` (see Point-in-time queries)
+and an optional `Idempotency-Key` header (see Idempotency).
 
 Example:
 ```bash
@@ -63,7 +67,8 @@ curl -s -X POST http://127.0.0.1:8000/accounts \
 
 curl -s -X POST http://127.0.0.1:8000/accounts/<ACCOUNT_ID>/deposits \
   -H "Content-Type: application/json" \
-  -d '{"amount": 10000, "currency": "INR", "occurred_at": "2026-11-03T10:00:00Z"}'
+  -H "Idempotency-Key: 6f1c2a9e-0b8d-4c55-9a53-2f4d1f7e1a10" \
+  -d '{"amount": 10000, "currency": "INR"}'
 
 curl -s "http://127.0.0.1:8000/accounts/<ACCOUNT_ID>/balance?as_of=2026-11-04T00:00:00Z"
 curl -s "http://127.0.0.1:8000/accounts/<ACCOUNT_ID>/audit?limit=20"
@@ -78,11 +83,12 @@ Business errors return `{"error": {"code": "...", "message": "..."}}`.
 | 403 | `system_account_not_allowed` | SYSTEM accounts (e.g. EXTERNAL) cannot be used through the public API |
 | 409 | `insufficient_funds` | Would overdraw a normal account |
 | 409 | `duplicate_transaction` | Transaction id already posted |
+| 409 | `idempotency_key_reused` | The key was already used for a different request |
 | 409 | `concurrent_modification` | Could not get exclusive access after retries (conflict, lock timeout or deadlock); safe to retry |
 | 422 | `currency_mismatch` | Request currency differs from the account currency |
 | 422 | `occurred_at_in_future` | `occurred_at` is later than now |
 | 422 | `invalid_money`, `invalid_transaction`, `unbalanced_transaction` | Request breaks a domain rule |
-| 422 | (FastAPI format) | Malformed body or parameter, including datetimes without a timezone |
+| 422 | (FastAPI format) | Malformed body, parameter or header, including datetimes without a timezone |
 
 **422** means the request itself is wrong; **409** means the request is fine but conflicts with the current state.
 
@@ -105,6 +111,7 @@ Business errors return `{"error": {"code": "...", "message": "..."}}`.
 3. Entries sum to exactly zero
 4. `occurred_at` is timezone-aware
 5. Entry amounts are never zero
+6. An idempotency key, if present, is 1 to 255 characters and not blank
 
 ## Database
 
@@ -141,6 +148,7 @@ erDiagram
 - A transaction must have at least 2 entries (deferred constraint trigger).
 - Entry amounts are never zero; accounts and transactions must exist.
 - `(account_id, account_version)` is unique, so two writers can never append the same version.
+- `idempotency_key` is unique.
 
 ### Migrations
 Plain SQL files in `migrations/`, applied in filename order and recorded in `schema_migrations`.
@@ -161,7 +169,7 @@ below zero. SYSTEM accounts such as `EXTERNAL` may go negative.
 
 **How it is prevented** (`services/ledger_service._post_once`):
 1. **Pessimistic row locks.** Inside the database transaction, every affected account row is locked with `SELECT ... FOR UPDATE`. A second writer touching the same account **waits**, then reads the data the first writer committed (READ COMMITTED gives a fresh snapshot per statement).
-2. **Lock ordering.** Accounts are always locked in sorted id order. A→B and B→A transfers both lock the lower id first, so they queue instead of **deadlocking**.
+2. **Lock ordering.** Accounts are always locked in sorted id order. A->B and B->A transfers both lock the lower id first, so they queue instead of **deadlocking**.
 3. **Lock timeout** (`LOCK_TIMEOUT`, 5s). A stuck lock holder cannot hang writers forever; a timeout becomes `ConcurrentModificationError`.
 4. **Optimistic safety net.** `UNIQUE (account_id, account_version)` still rejects a duplicate version if some code path ever skips the lock.
 5. **Retry with backoff.** `ConcurrentModificationError` is retried up to `MAX_ATTEMPTS` (3) with a short random pause. Business errors such as `InsufficientFundsError` are never retried. A deadlock reported by Postgres is also translated into this retriable error.
@@ -180,6 +188,47 @@ Race tests are probabilistic, so run them repeatedly:
 ```bash
 for i in 1 2 3 4 5; do pytest tests/services/test_concurrency.py -q || break; done
 ```
+
+## Idempotency
+A client that times out cannot know whether its request was processed. Retrying a deposit
+could post it twice. To make retries safe, send an `Idempotency-Key` header (use a UUID):
+
+- **First request with a key:** processed normally; the key is stored with the transaction (`transactions.idempotency_key`, unique).
+- **Same key, same request** (same accounts, amounts, currency and description): the **original transaction is returned** and nothing new is written. The replayed response is identical to the first one.
+- **Same key, different request:** `409 idempotency_key_reused`.
+- **Failed requests do not consume the key.** A rejected request (e.g. insufficient funds) leaves nothing behind, so the client can retry with the same key after fixing the cause.
+
+Design notes:
+- The key is checked **after the account locks are taken**. A racing duplicate waits for the first request's lock and then replays it; checking earlier could wrongly report "insufficient funds" for a replay. The unique constraint is the fallback if a duplicate still slips through.
+- `id` and `occurred_at` are ignored when comparing requests, because every retry generates new ones.
+- Keys are global and kept forever (the ledger is append-only); use UUIDs. Replays still take the account locks.
+
+## Security hardening
+**Least-privilege database role.** The running application should not connect as the table owner.
+Migration `005_app_role.sql` creates a non-login group role `ledger_app` that can only:
+- `SELECT` and `INSERT` on `accounts`, `transactions`, `entries`
+- `UPDATE` the `accounts.name` column (Postgres requires some UPDATE privilege for `SELECT ... FOR UPDATE`; this keeps `kind` and `allow_negative` read-only)
+
+It cannot `DELETE`, `TRUNCATE`, `DROP TRIGGER`, `ALTER`, or create tables. A login user is made a member of this role **outside** migrations, so no password is ever committed:
+```bash
+docker compose exec db psql -U ledger -d ledger -c "CREATE USER ledger_api PASSWORD 'ledger_api_dev_password' IN ROLE ledger_app;"
+```
+(The password above is for local development only.) Tests run the whole application flow through this login and verify the forbidden actions fail.
+
+**Configuration (environment variables):**
+| Variable | Meaning |
+|---|---|
+| `DATABASE_URL` | URL the running app uses (should be the restricted `ledger_api` login) |
+| `MIGRATION_DATABASE_URL` | URL used by `python -m app.db.migrate`; needs owner privileges. Falls back to `DATABASE_URL` |
+| `APP_ENV=production` | Refuse to start without an explicit `DATABASE_URL` instead of using the development default |
+
+Run the app as the restricted user, migrations as the owner:
+```bash
+python -m app.db.migrate
+DATABASE_URL=postgresql://ledger_api:ledger_api_dev_password@localhost:5433/ledger uvicorn app.main:app --reload
+```
+
+**Health checks:** `/health` (liveness) never touches the database; `/health/ready` (readiness) runs `SELECT 1` and returns `503` if the database is unreachable.
 
 ## Point-in-time queries
 Because history is kept as events, any past balance is just a sum over a filtered set of entries.
@@ -231,9 +280,10 @@ Design notes:
 2. Open a database transaction (`BEGIN`) and set a lock timeout
 3. Check every account exists and its currency matches the entry
 4. Lock every affected account row, in sorted order
-5. Per account: read balance + last version (one statement) and apply the overdraft rule
-6. Insert the `transactions` row, then each entry with the next `account_version`
-7. `COMMIT`, where the database re-checks the balance rule
+5. If the idempotency key was already used: replay the original (or reject a different request)
+6. Per account: read balance + last version (one statement) and apply the overdraft rule
+7. Insert the `transactions` row, then each entry with the next `account_version`
+8. `COMMIT`, where the database re-checks the balance rule
 
 Any failure rolls everything back, so there are no partial transfers.
 Service code needs an **autocommit** connection (`app.db.connection.connect`) so that
@@ -253,6 +303,8 @@ The API opens one such connection per request (`app/api/dependencies.py`).
 - **Two time axes** (`occurred_at`, `recorded_at`) so we can answer both "what was true" and "what did we know".
 - **Independent verification**: the audit re-derives the balance and cross-checks it, even though the database should make mismatches impossible.
 - **Pessimistic locks plus an optimistic version check**: locks make writers queue, the unique version is the safety net.
+- **Idempotency keys** make client retries safe; failed requests never burn a key.
+- **Least privilege**: the app's database login cannot alter history or schema, even if its code has a bug.
 
 ## Getting started
 ```bash
@@ -261,7 +313,8 @@ source .venv/Scripts/activate      # Git Bash on Windows
 pip install -r requirements.txt
 docker compose up -d               # PostgreSQL, host port 5433 -> container 5432
 docker compose exec db psql -U ledger -d ledger -c "CREATE DATABASE ledger_test;"   # once
-python -m app.db.migrate           # create the tables
+python -m app.db.migrate           # create the tables and the restricted role
+docker compose exec db psql -U ledger -d ledger -c "CREATE USER ledger_api PASSWORD 'ledger_api_dev_password' IN ROLE ledger_app;"   # once
 uvicorn app.main:app --reload      # run the API, then open /docs
 pytest                             # run tests (needs PostgreSQL running)
 ```

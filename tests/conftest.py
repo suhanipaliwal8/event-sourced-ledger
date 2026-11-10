@@ -4,7 +4,7 @@ import psycopg
 import pytest
 
 from fastapi.testclient import TestClient
-
+from urllib.parse import urlsplit, urlunsplit
 from app.api.dependencies import get_conn
 from app.main import app
 
@@ -69,3 +69,34 @@ def client(db_url: str):
     app.dependency_overrides[get_conn] = override_get_conn
     yield TestClient(app)
     app.dependency_overrides.clear()
+
+APP_ROLE_USER = "ledger_api"
+APP_ROLE_PASSWORD = "ledger_api_dev_password"
+
+
+@pytest.fixture(scope="session")
+def app_role_url(db_url: str) -> str:
+    """URL of the RESTRICTED login the running application should use."""
+    with psycopg.connect(db_url, autocommit=True) as admin:
+        exists = admin.execute(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (APP_ROLE_USER,)
+        ).fetchone()
+        if not exists:
+            # DDL cannot take bind parameters; these are fixed test constants.
+            admin.execute(
+                f"CREATE USER {APP_ROLE_USER} PASSWORD '{APP_ROLE_PASSWORD}' IN ROLE ledger_app"
+            )
+
+    parts = urlsplit(db_url)
+    host = parts.hostname + (f":{parts.port}" if parts.port else "")
+    netloc = f"{APP_ROLE_USER}:{APP_ROLE_PASSWORD}@{host}"
+    return urlunsplit(parts._replace(netloc=netloc))
+
+
+@pytest.fixture
+def app_conn(app_role_url: str):
+    connection = connect(app_role_url)
+    try:
+        yield connection
+    finally:
+        connection.close()

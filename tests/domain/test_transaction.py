@@ -124,3 +124,31 @@ def test_transfer_accepts_explicit_occurred_at():
     when = datetime(2026, 1, 1, tzinfo=timezone.utc)
     tx = Transaction.transfer(A, B, Money(100), occurred_at=when)
     assert tx.occurred_at == when
+
+def test_blank_idempotency_key_is_rejected():
+    with pytest.raises(InvalidTransactionError):
+        Transaction.transfer(A, B, Money(100), idempotency_key="   ")
+
+
+def test_too_long_idempotency_key_is_rejected():
+    with pytest.raises(InvalidTransactionError):
+        Transaction.transfer(A, B, Money(100), idempotency_key="k" * 256)
+
+
+def test_same_request_ignores_id_and_time():
+    first = Transaction.transfer(A, B, Money(100), "rent")
+    second = Transaction.transfer(A, B, Money(100), "rent")
+    assert first.id != second.id
+    assert first.same_request_as(second)
+
+
+def test_different_amount_is_a_different_request():
+    first = Transaction.transfer(A, B, Money(100))
+    second = Transaction.transfer(A, B, Money(200))
+    assert not first.same_request_as(second)
+
+
+def test_different_description_is_a_different_request():
+    first = Transaction.transfer(A, B, Money(100), "rent")
+    second = Transaction.transfer(A, B, Money(100), "food")
+    assert not first.same_request_as(second)

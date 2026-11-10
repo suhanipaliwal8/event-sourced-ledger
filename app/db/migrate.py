@@ -2,7 +2,7 @@ from pathlib import Path
 
 import psycopg
 
-from app.db.connection import get_database_url
+from app.db.connection import get_migration_database_url
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
@@ -13,7 +13,7 @@ def apply_migrations(database_url: str | None = None) -> list[str]:
     All pending migrations run in ONE transaction: either all apply or none.
     Returns the list of migration names applied in this run.
     """
-    database_url = database_url or get_database_url()
+    database_url = database_url or get_migration_database_url()
     applied_now: list[str] = []
 
     with psycopg.connect(database_url) as conn:  # commits on success, rolls back on error

@@ -36,3 +36,6 @@ class SystemAccountNotAllowedError(DomainError):
 
 class FutureTransactionError(DomainError):
     """occurred_at is in the future; transactions can only be dated now or earlier."""
+
+class IdempotencyKeyReusedError(DomainError):
+    """An idempotency key was reused for a request that differs from the original one."""
