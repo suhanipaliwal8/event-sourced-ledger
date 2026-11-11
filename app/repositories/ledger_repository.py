@@ -18,17 +18,23 @@ def insert_transaction(conn: psycopg.Connection, tx: Transaction) -> None:
 def get_account_state(conn: psycopg.Connection, account_id: UUID) -> tuple[int, int]:
     """Return (balance, last_version) for an account.
 
-    Both values are read in ONE statement, so they always belong to the same
-    snapshot of the data. Reading them separately could pair a stale balance
-    with a fresh version and let an overdraft slip through.
+    Uses the latest snapshot as a starting point, if one exists, and folds in
+    only the entries recorded after it. Both the snapshot lookup and the entries
+    query happen in the same call, but balance and last_version always come from
+    data consistent with each other (see the docstring on why that matters:
+    Phase 4's "one consistent read" requirement is preserved).
     """
+    snapshot = get_latest_snapshot(conn, account_id)
+    since_version = snapshot[0] if snapshot else 0
+    base_balance = snapshot[1] if snapshot else 0
+
     row = conn.execute(
-        "SELECT COALESCE(SUM(amount), 0), COALESCE(MAX(account_version), 0) "
-        "FROM entries WHERE account_id = %s",
-        (account_id,),
+        "SELECT COALESCE(SUM(amount), 0), COALESCE(MAX(account_version), %s) "
+        "FROM entries WHERE account_id = %s AND account_version > %s",
+        (since_version, account_id, since_version),
     ).fetchone()
-    # SUM() of bigint comes back as Decimal from Postgres, so convert to int.
-    return int(row[0]), int(row[1])
+    delta, last_version = int(row[0]), int(row[1])
+    return base_balance + delta, last_version
 
 
 def get_ledger_total(conn: psycopg.Connection) -> int:
@@ -101,4 +107,31 @@ def find_transaction_by_idempotency_key(
         id=row[0],
         occurred_at=row[2],
         idempotency_key=key,
+    )
+
+def get_latest_snapshot(
+    conn: psycopg.Connection, account_id: UUID
+) -> tuple[int, int] | None:
+    """Return (account_version, balance) of the account's snapshot, or None."""
+    row = conn.execute(
+        "SELECT account_version, balance FROM balance_snapshots WHERE account_id = %s",
+        (account_id,),
+    ).fetchone()
+    return (row[0], row[1]) if row is not None else None
+
+
+def save_snapshot(
+    conn: psycopg.Connection, account_id: UUID, account_version: int, balance: int
+) -> None:
+    """Upsert: keep only the LATEST snapshot per account."""
+    conn.execute(
+        """
+        INSERT INTO balance_snapshots (account_id, account_version, balance, created_at)
+        VALUES (%s, %s, %s, now())
+        ON CONFLICT (account_id)
+        DO UPDATE SET account_version = EXCLUDED.account_version,
+                      balance = EXCLUDED.balance,
+                      created_at = EXCLUDED.created_at
+        """,
+        (account_id, account_version, balance),
     )
