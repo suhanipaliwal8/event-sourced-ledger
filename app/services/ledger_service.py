@@ -7,6 +7,7 @@ from uuid import UUID
 import psycopg
 
 from app.domain.account import EXTERNAL_ACCOUNT_ID, Account
+from app.domain.entry import Entry
 from app.domain.errors import (
     AccountNotFoundError,
     ConcurrentModificationError,
@@ -14,15 +15,22 @@ from app.domain.errors import (
     DuplicateTransactionError,
     FutureTransactionError,
     IdempotencyKeyReusedError,
+    InvalidTransactionError,
+
 )
 from app.domain.money import Money
 from app.domain.transaction import Transaction
-from app.repositories.accounts import get_account, lock_account
+from app.repositories.accounts import (
+    get_account,
+    get_or_create_fx_clearing_account,
+    lock_account,
+)
 from app.repositories.ledger_repository import (
     find_transaction_by_idempotency_key,
     get_account_state,
     get_balance_at,
     get_ledger_total as _get_ledger_total,
+    get_ledger_totals_by_currency as _get_ledger_totals_by_currency,
     insert_entry,
     insert_transaction,
     save_snapshot,
@@ -264,3 +272,51 @@ def _load_accounts(conn: psycopg.Connection, tx: Transaction) -> dict[UUID, Acco
 def deltas_count(tx: Transaction, account_id: UUID) -> int:
     """How many of this transaction's entries touched this account (usually 1)."""
     return sum(1 for e in tx.entries if e.account_id == account_id)
+
+def fx_transfer(
+    conn: psycopg.Connection,
+    from_account_id: UUID,
+    send_money: Money,
+    to_account_id: UUID,
+    receive_money: Money,
+    description: str = "fx transfer",
+    occurred_at: datetime | None = None,
+    idempotency_key: str | None = None,
+) -> Transaction:
+    """Move money between accounts of DIFFERENT currencies, at a rate implied
+    by the two amounts (receive_money.amount / send_money.amount), locked in
+    at posting time.
+
+    Built as 4 entries through each currency's FX clearing account, so each
+    currency balances on its own (see module docstring in README: "Snapshots"
+    and "Multi-currency" sections).
+    """
+    if from_account_id == to_account_id:
+        raise InvalidTransactionError("cannot transfer to the same account")
+    if send_money.amount <= 0 or receive_money.amount <= 0:
+        raise InvalidTransactionError("send and receive amounts must be positive")
+    if send_money.currency == receive_money.currency:
+        raise InvalidTransactionError(
+            "send and receive currencies are the same; use transfer() instead"
+        )
+
+    send_clearing = get_or_create_fx_clearing_account(conn, send_money.currency)
+    receive_clearing = get_or_create_fx_clearing_account(conn, receive_money.currency)
+
+    tx = Transaction(
+        description=description,
+        entries=(
+            Entry(from_account_id, -send_money),
+            Entry(send_clearing.id, send_money),
+            Entry(receive_clearing.id, -receive_money),
+            Entry(to_account_id, receive_money),
+        ),
+        occurred_at=occurred_at or datetime.now(timezone.utc),
+        idempotency_key=idempotency_key,
+    )
+    return post_transaction(conn, tx)
+
+
+def get_ledger_totals_by_currency(conn: psycopg.Connection) -> dict[str, int]:
+    """Per-currency ledger totals. Every value must always be 0."""
+    return _get_ledger_totals_by_currency(conn)
