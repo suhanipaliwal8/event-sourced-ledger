@@ -30,12 +30,17 @@ def test_fx_clearing_accounts_absorb_the_difference(ledger_conn):
     rahul = create_account(ledger_conn, "Rahul", currency="INR")
     deposit(ledger_conn, asha.id, Money(10_000, "USD"))
 
+    usd_clearing_id = fx_clearing_account_id("USD")
+    inr_clearing_id = fx_clearing_account_id("INR")
+    usd_before = get_balance(ledger_conn, usd_clearing_id).amount
+    inr_before = get_balance(ledger_conn, inr_clearing_id).amount
+
     fx_transfer(ledger_conn, asha.id, Money(10_000, "USD"), rahul.id, Money(830_000, "INR"))
 
-    usd_clearing = get_balance(ledger_conn, fx_clearing_account_id("USD"))
-    inr_clearing = get_balance(ledger_conn, fx_clearing_account_id("INR"))
-    assert usd_clearing == Money(10_000, "USD")
-    assert inr_clearing == Money(-830_000, "INR")
+    usd_after = get_balance(ledger_conn, usd_clearing_id).amount
+    inr_after = get_balance(ledger_conn, inr_clearing_id).amount
+    assert usd_after - usd_before == 10_000
+    assert inr_after - inr_before == -830_000
 
 
 def test_every_currency_is_conserved_across_the_whole_ledger(ledger_conn):
