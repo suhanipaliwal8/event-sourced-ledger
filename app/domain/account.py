@@ -30,7 +30,7 @@ class Account:
 
 # Fixed namespace for deriving FX clearing account ids deterministically from
 # a currency code, the same way EXTERNAL_ACCOUNT_ID is a fixed, known id.
-_FX_CLEARING_NAMESPACE = UUID("00000000-0000-0000-0000-00000000fxc0")
+_FX_CLEARING_NAMESPACE = UUID("00000000-0000-0000-0000-00000000fec0")
 
 
 def fx_clearing_account_id(currency: str) -> UUID:
