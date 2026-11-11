@@ -25,12 +25,15 @@ from app.repositories.ledger_repository import (
     get_ledger_total as _get_ledger_total,
     insert_entry,
     insert_transaction,
+    save_snapshot,
 )
 
 # How long a writer waits for another writer's account lock before giving up.
 LOCK_TIMEOUT = "5s"
 # How many times a conflicting post is attempted in total.
 MAX_ATTEMPTS = 3
+# How often (in entries) a snapshot is refreshed for an account.
+SNAPSHOT_EVERY_N_ENTRIES = 100
 
 
 def post_transaction(
@@ -110,6 +113,19 @@ def _post_once(conn: psycopg.Connection, tx: Transaction) -> Transaction:
                     conn, tx.id, entry.account_id, version, entry.money.amount
                 )
                 next_version[entry.account_id] = version + 1
+
+            # Opportunistic snapshotting: after this account crosses a multiple of
+            # SNAPSHOT_EVERY_N_ENTRIES, refresh its snapshot in the SAME database
+            # transaction, so the snapshot's version is always consistent with what
+            # was just committed. This never changes the account's balance, only
+            # how much history a future read has to replay.
+            for account_id in sorted_ids:
+                new_version = next_version[account_id] - 1
+                if new_version // SNAPSHOT_EVERY_N_ENTRIES > (
+                    (new_version - deltas_count(tx, account_id)) // SNAPSHOT_EVERY_N_ENTRIES
+                ):
+                    balance, _ = get_account_state(conn, account_id)
+                    save_snapshot(conn, account_id, new_version, balance)
     except psycopg.errors.UniqueViolation as exc:
         # The rollback has already happened. Translate the DB error into a
         # business outcome, based on which constraint was violated.
@@ -244,3 +260,7 @@ def _load_accounts(conn: psycopg.Connection, tx: Transaction) -> dict[UUID, Acco
                 f"{entry.account_id} is in {accounts[entry.account_id].currency}"
             )
     return accounts
+
+def deltas_count(tx: Transaction, account_id: UUID) -> int:
+    """How many of this transaction's entries touched this account (usually 1)."""
+    return sum(1 for e in tx.entries if e.account_id == account_id)
