@@ -25,7 +25,7 @@ Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest
 | 7 | Audit trail | Done |
 | 8 | Concurrency control | Done |
 | 9 | Idempotency and hardening | Done |
-| 10 | Snapshots (stretch) | Planned |
+| 10 | Snapshots (stretch) | Done |
 | 11 | Multi-currency (stretch) | Planned |
 
 ## Architecture
@@ -273,6 +273,36 @@ Design notes:
 - All queries run in one read-only **REPEATABLE READ** transaction, so they see a single snapshot and a concurrent deposit cannot cause a false mismatch.
 - Summary and integrity cover the **full** history; only `lines` are paged, so running balances stay correct on every page. `next_after_version` is `null` on the last page.
 - The whole history is replayed per request; snapshots (Phase 10) will reduce that cost.
+
+## Snapshots (performance)
+Computing a balance or replaying an audit trail means scanning an account's entries, and
+that scan grows with history length. A `balance_snapshots` table caches a checkpoint:
+*"this account's balance was B as of version N."* Reading a balance then means
+**snapshot + only the entries recorded after it**, instead of the whole history.
+
+**Safety property (the whole point of event sourcing): a snapshot is derived, disposable
+data.** `entries` remains the only source of truth. Deleting every snapshot must never
+change any answer — only how much has to be replayed to produce it. This is proven by a
+dedicated test that deletes an account's snapshot and checks the balance is unchanged.
+
+**How a snapshot is taken:**
+- Opportunistically, right after a successful post, once an account's version crosses a
+  multiple of `SNAPSHOT_EVERY_N_ENTRIES` (100).
+- Inside the **same database transaction** as the post, under the account's existing lock,
+  so the snapshot's version is always consistent with what was just committed and
+  inherits Phase 8's concurrency protection for free.
+- Only the **latest** snapshot per account is kept (an upsert); there is no history of
+  snapshots.
+
+**Trade-off (cadence):** every 100 entries balances write cost (a few extra snapshot
+writes) against read cost (at most 99 entries to replay on top of a snapshot). A smaller
+number means faster reads but more snapshot churn; a larger number means the opposite.
+
+**What still bypasses snapshots, deliberately:** point-in-time queries (`as_of`/`known_at`
+in Phase 6) always scan full history, because a snapshot only reflects the *latest* known
+state and is not valid for an arbitrary past moment. The audit trail also replays raw
+entries directly, so its running-balance lines are always a true step-by-step reconstruction;
+only the plain current-balance path benefits from snapshots.
 
 ## How a transaction is posted
 `services/ledger_service.post_transaction(conn, tx)`:
