@@ -2,7 +2,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 
-from app.domain.account import Account, fx_clearing_account_id
+from app.domain.account import Account, external_account_id, fx_clearing_account_id
 
 
 def create_account(
@@ -56,4 +56,20 @@ def get_or_create_fx_clearing_account(conn: psycopg.Connection, currency: str) -
     )
     account = get_account(conn, account_id)
     assert account is not None   # the row above guarantees it now exists
+    return account
+
+def get_or_create_external_account(conn: psycopg.Connection, currency: str) -> Account:
+    """Return the 'outside world' account for this currency, creating it on
+    first use (except INR, which already exists from Phase 3's seed migration).
+    """
+    account_id = external_account_id(currency)
+    if currency != "INR":
+        conn.execute(
+            "INSERT INTO accounts (id, name, kind, currency, allow_negative) "
+            "VALUES (%s, %s, 'SYSTEM', %s, TRUE) "
+            "ON CONFLICT (id) DO NOTHING",
+            (account_id, f"EXTERNAL_{currency}", currency),
+        )
+    account = get_account(conn, account_id)
+    assert account is not None
     return account

@@ -22,6 +22,7 @@ from app.domain.money import Money
 from app.domain.transaction import Transaction
 from app.repositories.accounts import (
     get_account,
+    get_or_create_external_account,
     get_or_create_fx_clearing_account,
     lock_account,
 )
@@ -182,9 +183,10 @@ def deposit(
     occurred_at: datetime | None = None,
     idempotency_key: str | None = None,
 ) -> Transaction:
-    """Money arrives from the outside world: EXTERNAL -x, account +x."""
+    """Money arrives from the outside world: EXTERNAL(currency) -x, account +x."""
+    external = get_or_create_external_account(conn, money.currency)
     tx = Transaction.transfer(
-        EXTERNAL_ACCOUNT_ID, account_id, money, description, occurred_at, idempotency_key
+        external.id, account_id, money, description, occurred_at, idempotency_key
     )
     return post_transaction(conn, tx)
 
@@ -197,9 +199,10 @@ def withdraw(
     occurred_at: datetime | None = None,
     idempotency_key: str | None = None,
 ) -> Transaction:
-    """Money leaves to the outside world: account -x, EXTERNAL +x."""
+    """Money leaves to the outside world: account -x, EXTERNAL(currency) +x."""
+    external = get_or_create_external_account(conn, money.currency)
     tx = Transaction.transfer(
-        account_id, EXTERNAL_ACCOUNT_ID, money, description, occurred_at, idempotency_key
+        account_id, external.id, money, description, occurred_at, idempotency_key
     )
     return post_transaction(conn, tx)
 

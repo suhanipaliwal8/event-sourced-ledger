@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from uuid import UUID, uuid5
+from uuid import UUID
+import uuid as _uuid
 
 from app.domain.errors import InsufficientFundsError
 
@@ -30,7 +31,7 @@ class Account:
 
 # Fixed namespace for deriving FX clearing account ids deterministically from
 # a currency code, the same way EXTERNAL_ACCOUNT_ID is a fixed, known id.
-_FX_CLEARING_NAMESPACE = UUID("00000000-0000-0000-0000-00000000fec0")
+_FX_CLEARING_NAMESPACE = _uuid.UUID("00000000-0000-0000-0000-00000000fec0")
 
 
 def fx_clearing_account_id(currency: str) -> UUID:
@@ -39,4 +40,19 @@ def fx_clearing_account_id(currency: str) -> UUID:
     Same currency always maps to the same id, so it can be looked up or
     created without a prior directory of "which currencies exist".
     """
-    return uuid5(_FX_CLEARING_NAMESPACE, currency)
+    return _uuid.uuid5(_FX_CLEARING_NAMESPACE, currency)
+
+_EXTERNAL_NAMESPACE = _uuid.UUID("00000000-0000-0000-0000-00000000ec00")
+
+
+def external_account_id(currency: str) -> UUID:
+    """The id of the 'outside world' account for a given currency.
+
+    INR keeps using the original, already-seeded EXTERNAL_ACCOUNT_ID (Phase 3),
+    so every pre-existing deposit/withdrawal and test is unaffected. Any other
+    currency gets its own deterministic id, created lazily like an FX clearing
+    account.
+    """
+    if currency == "INR":
+        return EXTERNAL_ACCOUNT_ID
+    return _uuid.uuid5(_EXTERNAL_NAMESPACE, currency)
