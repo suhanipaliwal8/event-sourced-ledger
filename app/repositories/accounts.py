@@ -2,7 +2,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 
-from app.domain.account import Account
+from app.domain.account import Account, fx_clearing_account_id
 
 
 def create_account(
@@ -38,3 +38,22 @@ def lock_account(conn: psycopg.Connection, account_id: UUID) -> None:
     Must be called inside a transaction (it is released on COMMIT or ROLLBACK).
     """
     conn.execute("SELECT 1 FROM accounts WHERE id = %s FOR UPDATE", (account_id,))
+
+def get_or_create_fx_clearing_account(conn: psycopg.Connection, currency: str) -> Account:
+    """Return this currency's FX clearing account, creating it on first use.
+
+    The id is DETERMINISTIC (see app.domain.account.fx_clearing_account_id), so
+    concurrent first-time callers for the same currency race harmlessly:
+    ON CONFLICT (id) DO NOTHING means at most one INSERT wins, and everyone then
+    reads the same, single row.
+    """
+    account_id = fx_clearing_account_id(currency)
+    conn.execute(
+        "INSERT INTO accounts (id, name, kind, currency, allow_negative) "
+        "VALUES (%s, %s, 'SYSTEM', %s, TRUE) "
+        "ON CONFLICT (id) DO NOTHING",
+        (account_id, f"FX_CLEARING_{currency}", currency),
+    )
+    account = get_account(conn, account_id)
+    assert account is not None   # the row above guarantees it now exists
+    return account
