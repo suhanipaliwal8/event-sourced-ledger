@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -19,9 +20,11 @@ class Transaction:
 
     Invariants (checked on creation, so an invalid Transaction cannot exist):
       1. at least 2 entries
-      2. all entries use the same currency (multi-currency comes in Phase 11)
-      3. entries sum to exactly zero
-      4. occurred_at is timezone-aware
+      2. entries sum to exactly zero WITHIN EACH CURRENCY (a single-currency
+         transaction is the special case of one currency group; cross-currency
+         transfers add FX clearing entries so each currency group still balances)
+      3. occurred_at is timezone-aware
+      4. entry amounts are never zero (enforced by Entry itself)
       5. an idempotency key, if present, is 1 to 255 characters and not blank
     """
 
@@ -33,7 +36,6 @@ class Transaction:
 
     def __post_init__(self) -> None:
         # If someone passed a list, freeze it into a tuple.
-        # (object.__setattr__ is needed because the dataclass is frozen.)
         object.__setattr__(self, "entries", tuple(self.entries))
 
         if not self.description.strip():
@@ -50,17 +52,14 @@ class Transaction:
                 f"idempotency key must be 1 to {MAX_IDEMPOTENCY_KEY_LENGTH} characters and not blank"
             )
 
-        currencies = {e.money.currency for e in self.entries}
-        if len(currencies) != 1:
-            raise InvalidTransactionError(
-                "all entries must use the same currency (for now)"
-            )
-
-        total = sum(e.money.amount for e in self.entries)
-        if total != 0:
-            raise UnbalancedTransactionError(
-                f"entries must sum to zero, but sum to {total}"
-            )
+        totals_by_currency: dict[str, int] = defaultdict(int)
+        for e in self.entries:
+            totals_by_currency[e.money.currency] += e.money.amount
+        for currency, total in totals_by_currency.items():
+            if total != 0:
+                raise UnbalancedTransactionError(
+                    f"entries in {currency} must sum to zero, but sum to {total}"
+                )
 
     def same_request_as(self, other: "Transaction") -> bool:
         """True if both describe the same request: same accounts, signed amounts,
@@ -85,7 +84,7 @@ class Transaction:
         occurred_at: datetime | None = None,
         idempotency_key: str | None = None,
     ) -> "Transaction":
-        """Convenience builder: move `money` from one account to another."""
+        """Convenience builder: move `money` from one account to another, SAME currency."""
         if from_account == to_account:
             raise InvalidTransactionError("cannot transfer to the same account")
         if money.amount <= 0:
