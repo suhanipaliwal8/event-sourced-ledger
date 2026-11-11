@@ -135,3 +135,15 @@ def save_snapshot(
         """,
         (account_id, account_version, balance),
     )
+
+def get_ledger_totals_by_currency(conn: psycopg.Connection) -> dict[str, int]:
+    """Sum of entries, grouped by the owning account's currency.
+
+    In a correct ledger, EVERY currency's total is 0 (get_ledger_total alone is
+    only meaningful for a single-currency ledger; this is the multi-currency
+    equivalent)."""
+    rows = conn.execute(
+        "SELECT a.currency, SUM(e.amount) FROM entries e "
+        "JOIN accounts a ON a.id = e.account_id GROUP BY a.currency"
+    ).fetchall()
+    return {currency: int(total) for currency, total in rows}
