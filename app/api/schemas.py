@@ -161,3 +161,14 @@ class AuditOut(FromDomain):
     integrity: AuditIntegrityOut
     lines: list[AuditLineOut]
     next_after_version: int | None
+
+# ---------- fx transfer ----------
+class FxTransferRequest(BaseModel):
+    from_account_id: UUID
+    to_account_id: UUID
+    send_amount: Amount
+    send_currency: CurrencyCode
+    receive_amount: Amount
+    receive_currency: CurrencyCode
+    description: str | None = Field(default=None, max_length=200)
+    occurred_at: AwareDatetime | None = None
