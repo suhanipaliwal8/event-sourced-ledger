@@ -26,7 +26,7 @@ Python 3.12 · FastAPI · PostgreSQL 16 · psycopg 3 · Docker Compose · pytest
 | 8 | Concurrency control | Done |
 | 9 | Idempotency and hardening | Done |
 | 10 | Snapshots (stretch) | Done |
-| 11 | Multi-currency (stretch) | Planned |
+| 11 | Multi-currency (stretch) | Done |
 
 ## Architecture
 ```
@@ -55,6 +55,7 @@ Floats and numeric strings are rejected. Every money request states its `currenc
 | POST | /accounts/{id}/deposits | Deposit money (from the outside world) | 201 |
 | POST | /accounts/{id}/withdrawals | Withdraw money (to the outside world) | 201 |
 | POST | /transfers | Transfer between two customer accounts | 201 |
+| POST | /fx-transfers | Transfer between accounts in DIFFERENT currencies, at an implied rate | 201 |
 
 Deposits, withdrawals and transfers accept an optional `occurred_at` (see Point-in-time queries)
 and an optional `Idempotency-Key` header (see Idempotency).
@@ -284,6 +285,44 @@ that scan grows with history length. A `balance_snapshots` table caches a checkp
 data.** `entries` remains the only source of truth. Deleting every snapshot must never
 change any answer — only how much has to be replayed to produce it. This is proven by a
 dedicated test that deletes an account's snapshot and checks the balance is unchanged.
+
+## Multi-currency
+A transfer between accounts of different currencies cannot simply "sum to zero" in raw
+amounts — dollars and rupees aren't the same unit. The invariant is generalized:
+**entries must sum to zero within each currency**, not globally. A same-currency
+transaction is the special case of a single currency group, so every transaction built
+before this phase still satisfies the rule unchanged.
+
+**How an FX transfer stays balanced in two currencies at once:** each currency gets its
+own **FX clearing account** (a SYSTEM account, like `EXTERNAL`, with a fixed id derived
+deterministically from the currency code). A transfer of $100 from Asha (USD) to Rahul
+(INR) becomes four entries:
+Asha -100 USD
+FX_CLEARING_USD +100 USD <- USD group sums to 0
+FX_CLEARING_INR -8300 INR <- INR group sums to 0
+Rahul +8300 INR
+
+
+The clearing accounts accumulate the bank's own currency inventory over time; that's by
+design, not a bug, and they're auditable like any other account.
+
+**The rate is never stored or trusted as a separate number.** The client supplies both
+amounts (`send_amount`/`send_currency`, `receive_amount`/`receive_currency`); the implied
+rate is `receive / send`, locked in at posting time by the two integer amounts actually
+posted — no floating-point rate ever touches a balance.
+
+`POST /fx-transfers` creates a clearing account for a currency on first use
+(`get_or_create_fx_clearing_account`), safe under concurrent first-time creation because
+its id is deterministic and the insert uses `ON CONFLICT (id) DO NOTHING`.
+
+**What had to change elsewhere, and why:**
+- The database's commit-time balance trigger (migration 007 supersedes migration 003's
+  function) checks the sum **per currency**, not as one global total.
+- The audit's `unbalanced_transactions` integrity check does the same, so a valid FX
+  transaction is never falsely flagged.
+- `get_ledger_total()` (one number) is only meaningful for a single-currency ledger;
+  `get_ledger_totals_by_currency()` gives the correct, currency-by-currency version,
+  where every value must always be 0.
 
 **How a snapshot is taken:**
 - Opportunistically, right after a successful post, once an account's version crosses a

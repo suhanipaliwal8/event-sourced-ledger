@@ -152,3 +152,30 @@ def test_different_description_is_a_different_request():
     first = Transaction.transfer(A, B, Money(100), "rent")
     second = Transaction.transfer(A, B, Money(100), "food")
     assert not first.same_request_as(second)
+
+def test_multi_currency_transaction_balanced_per_currency_is_accepted():
+    clearing_usd, clearing_inr = uuid4(), uuid4()
+    tx = Transaction(
+        description="fx transfer",
+        entries=(
+            Entry(A, Money(-100, "USD")),
+            Entry(clearing_usd, Money(100, "USD")),
+            Entry(clearing_inr, Money(-8_300, "INR")),
+            Entry(B, Money(8_300, "INR")),
+        ),
+    )
+    assert len(tx.entries) == 4
+
+
+def test_multi_currency_transaction_unbalanced_in_one_currency_is_rejected():
+    clearing_usd, clearing_inr = uuid4(), uuid4()
+    with pytest.raises(UnbalancedTransactionError):
+        Transaction(
+            description="fx transfer",
+            entries=(
+                Entry(A, Money(-100, "USD")),
+                Entry(clearing_usd, Money(90, "USD")),      # USD group doesn't sum to 0
+                Entry(clearing_inr, Money(-8_300, "INR")),
+                Entry(B, Money(8_300, "INR")),
+            ),
+        )

@@ -12,6 +12,7 @@ from app.api.schemas import (
     AccountOut,
     AuditOut,
     BalanceOut,
+    FxTransferRequest,
     MoneyRequest,
     TransactionOut,
     TransferRequest,
@@ -161,3 +162,23 @@ def read_audit_trail(
 ):
     report = audit_service.get_audit_trail(conn, account_id, after_version, limit)
     return AuditOut.model_validate(report)
+
+@router.post("/fx-transfers", response_model=TransactionOut, status_code=201)
+def make_fx_transfer(
+    body: FxTransferRequest,
+    conn: Conn,
+    idempotency_key: IdempotencyKey = None,
+):
+    _require_customer_account(conn, body.from_account_id)
+    _require_customer_account(conn, body.to_account_id)
+    tx = ledger_service.fx_transfer(
+        conn,
+        body.from_account_id,
+        Money(body.send_amount, body.send_currency),
+        body.to_account_id,
+        Money(body.receive_amount, body.receive_currency),
+        body.description or "fx transfer",
+        body.occurred_at,
+        idempotency_key,
+    )
+    return TransactionOut.from_domain(tx)

@@ -25,3 +25,13 @@ def test_system_account_may_go_negative():
 
 def test_credit_is_always_allowed():
     assert make_account(False).new_balance_after(0, 500) == 500
+
+from app.domain.account import fx_clearing_account_id
+
+
+def test_fx_clearing_account_id_is_deterministic():
+    assert fx_clearing_account_id("USD") == fx_clearing_account_id("USD")
+
+
+def test_fx_clearing_account_id_differs_per_currency():
+    assert fx_clearing_account_id("USD") != fx_clearing_account_id("INR")

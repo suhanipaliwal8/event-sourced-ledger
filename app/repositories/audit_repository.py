@@ -55,17 +55,20 @@ def get_account_history(conn: psycopg.Connection, account_id: UUID) -> list[Hist
 
 
 def count_unbalanced_transactions(conn: psycopg.Connection, account_id: UUID) -> int:
-    """How many transactions touching this account do NOT sum to zero (should be 0)."""
+    """How many transactions touching this account do NOT sum to zero IN EACH
+    CURRENCY they use (should always be 0 — this mirrors the database trigger
+    as an independent check, see migration 007)."""
     row = conn.execute(
         """
-        SELECT COUNT(*) FROM (
-            SELECT transaction_id
-            FROM entries
-            WHERE transaction_id IN (
+        SELECT COUNT(DISTINCT transaction_id) FROM (
+            SELECT e.transaction_id, a.currency
+            FROM entries e
+            JOIN accounts a ON a.id = e.account_id
+            WHERE e.transaction_id IN (
                 SELECT transaction_id FROM entries WHERE account_id = %s
             )
-            GROUP BY transaction_id
-            HAVING SUM(amount) <> 0
+            GROUP BY e.transaction_id, a.currency
+            HAVING SUM(e.amount) <> 0
         ) AS unbalanced
         """,
         (account_id,),
