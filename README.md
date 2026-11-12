@@ -216,6 +216,8 @@ docker compose exec db psql -U ledger -d ledger -c "CREATE USER ledger_api PASSW
 ```
 (The password above is for local development only.) Tests run the whole application flow through this login and verify the forbidden actions fail.
 
+A `.env.example` documents all four variables (including `TEST_DATABASE_URL`); copy it to `.env` for local development — `.env` itself is gitignored and must never be committed.
+
 **Configuration (environment variables):**
 | Variable | Meaning |
 |---|---|
@@ -380,6 +382,7 @@ The API opens one such connection per request (`app/api/dependencies.py`).
 python -m venv .venv
 source .venv/Scripts/activate      # Git Bash on Windows
 pip install -r requirements.txt
+cp .env.example .env               # then edit values if needed
 docker compose up -d               # PostgreSQL, host port 5433 -> container 5432
 docker compose exec db psql -U ledger -d ledger -c "CREATE DATABASE ledger_test;"   # once
 python -m app.db.migrate           # create the tables and the restricted role
